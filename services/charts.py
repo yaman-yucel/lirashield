@@ -1,5 +1,7 @@
 """
 Charts service for generating fund price charts.
+
+Uses only database data - no network calls.
 """
 
 import pandas as pd
@@ -7,20 +9,19 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from core.database import get_fund_prices
-from core.analysis import fetch_usd_rates_for_date_range, get_usd_rates_as_dataframe
+from core.analysis import get_usd_rates_as_dataframe
 
 
 class ChartsService:
     """Service for generating fund price charts."""
 
     @staticmethod
-    def generate_fund_chart(ticker: str, auto_fetch_usd: bool, base_date: str | None = None) -> tuple[go.Figure | None, str]:
+    def generate_fund_chart(ticker: str, base_date: str | None = None) -> tuple[go.Figure | None, str]:
         """
         Generate a dual-axis chart showing fund price in both TRY and USD terms.
 
         Args:
             ticker: Fund ticker symbol
-            auto_fetch_usd: Whether to auto-fetch missing USD rates
             base_date: Optional start date to filter data from (YYYY-MM-DD)
 
         Returns:
@@ -50,14 +51,9 @@ class ChartsService:
         start_date = prices_df["date"].min()
         end_date = prices_df["date"].max()
 
-        # Fetch USD rates for this date range if auto_fetch is enabled
-        if auto_fetch_usd:
-            count, msg = fetch_usd_rates_for_date_range(start_date, end_date)
-            status_parts = [msg] if count > 0 else []
-        else:
-            status_parts = []
+        status_parts = []
 
-        # Get USD rates
+        # Get USD rates from database (no network calls)
         usd_df = get_usd_rates_as_dataframe(start_date, end_date)
 
         # Merge fund prices with USD rates
@@ -124,19 +120,18 @@ class ChartsService:
 
         if usd_prices < total_prices:
             missing = total_prices - usd_prices
-            status_parts.append(f"⚠️ {missing} dates missing USD rates")
+            status_parts.append(f"⚠️ {missing} dates missing USD rates (fetch in USD Rates tab)")
 
         return fig, "\n".join(status_parts)
 
     @staticmethod
-    def generate_normalized_chart(tickers_str: str, auto_fetch_usd: bool, show_usd: bool, base_date: str | None = None) -> tuple[go.Figure | None, str]:
+    def generate_normalized_chart(tickers_str: str, show_usd: bool, base_date: str | None = None) -> tuple[go.Figure | None, str]:
         """
         Generate a normalized comparison chart for multiple funds.
         All funds are normalized to 100 at the base date for easy comparison.
 
         Args:
             tickers_str: Comma-separated list of tickers
-            auto_fetch_usd: Whether to auto-fetch missing USD rates
             show_usd: Whether to show USD-denominated values
             base_date: Optional base date for normalization (YYYY-MM-DD)
 
@@ -173,13 +168,7 @@ class ChartsService:
         start_date = min(all_dates)
         end_date = max(all_dates)
 
-        # Fetch USD rates if needed
-        if auto_fetch_usd and show_usd:
-            count, msg = fetch_usd_rates_for_date_range(start_date, end_date)
-            if count > 0:
-                status_parts.append(msg)
-
-        # Get USD rates
+        # Get USD rates from database (no network calls)
         usd_df = get_usd_rates_as_dataframe(start_date, end_date)
         if not usd_df.empty:
             usd_df["date"] = pd.to_datetime(usd_df["date"])
