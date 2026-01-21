@@ -7,13 +7,14 @@ Creates the Gradio blocks UI for portfolio tracking with inflation adjustment.
 from datetime import datetime
 
 import gradio as gr
+import pandas as pd
 
 from ui.handlers import (
     # Transaction handlers
     handle_add_transaction,
     handle_delete_transaction,
     refresh_portfolio,
-    handle_refresh_tefas_prices,
+    handle_refresh_prices,
     get_ticker_price_table,
     get_unique_tickers,
     # Rate handlers
@@ -33,6 +34,14 @@ from ui.handlers import (
     generate_normalized_chart,
     # Analysis handlers
     analyze_portfolio,
+    # Refresh handlers
+    handle_refresh_cpi_csv,
+    handle_quick_check_usdtry,
+    handle_long_check_usdtry,
+    handle_quick_check_us_stocks,
+    handle_long_check_us_stocks,
+    handle_quick_check_tefas,
+    handle_long_check_tefas,
 )
 
 
@@ -54,20 +63,31 @@ def create_ui() -> gr.Blocks:
         with gr.Tab("📊 Transactions"):
             gr.Markdown(
                 """
-                ### Add Buy Transactions
-                *Price is automatically fetched from TEFAS based on the transaction date.*
+                ### Add Transactions (Buy / Sell)
+                *Prices are automatically fetched based on asset type: TEFAS for Turkish funds, yfinance for US stocks.*
+                *You can also manually enter the buy price - leave empty to auto-fetch.*
+                *Sells use FIFO (First In, First Out) to match with oldest buy lots for cost basis calculation.*
                 """
             )
 
             with gr.Row():
                 with gr.Column(scale=2):
                     with gr.Row():
-                        tx_date = gr.DateTime(label="Purchase Date", value=datetime.now(), type="string", include_time=False)
-                        tx_ticker = gr.Textbox(label="TEFAS Fund Code", placeholder="e.g., MAC, TI2, AFT", max_lines=1)
+                        tx_type = gr.Radio(choices=["Buy", "Sell"], value="Buy", label="Transaction Type", info="Buy = acquire shares, Sell = dispose shares (FIFO matched)")
+                        tx_asset_type = gr.Dropdown(
+                            choices=["TEFAS Fund (TRY)", "US Stock (USD)", "Cash (TRY)", "Cash (USD)"], value="TEFAS Fund (TRY)", label="Asset Type", info="Select the type of asset"
+                        )
                     with gr.Row():
-                        tx_qty = gr.Number(label="Quantity", value=1, minimum=0.0001, precision=4)
-                        tx_tax = gr.Number(label="Tax Rate at Sell (%)", value=0, minimum=0, maximum=100, precision=2, info="Tax on TRY gains")
-                    tx_notes = gr.Textbox(label="Notes (optional)", placeholder="e.g., Bought on dip/Birthday buy", max_lines=1)
+                        tx_date = gr.DateTime(label="Transaction Date", value=datetime.now(), type="string", include_time=False)
+                        tx_ticker = gr.Textbox(
+                            label="Ticker / Currency", placeholder="e.g., MAC, TI2 (TEFAS) or NVDA, META (US Stock) or TRY/USD (Cash)", max_lines=1, info="For cash, enter TRY or USD"
+                        )
+                    with gr.Row():
+                        tx_qty = gr.Number(label="Quantity / Amount", value=1, minimum=0.0001, precision=4, info="Shares for stocks/funds, amount for cash")
+                        tx_buy_price = gr.Number(label="Buy Price (optional)", value=None, minimum=0, precision=6, info="Leave empty to auto-fetch price from TEFAS/yfinance")
+                    with gr.Row():
+                        tx_tax = gr.Number(label="Tax Rate at Sell (%)", value=0, minimum=0, maximum=100, precision=2, info="Tax on gains (0% for US stocks)")
+                    tx_notes = gr.Textbox(label="Notes (optional)", placeholder="e.g., Bought on dip / Sold for profit", max_lines=1)
 
                     with gr.Row():
                         btn_add_tx = gr.Button("💾 Save Transaction", variant="primary")
@@ -84,168 +104,255 @@ def create_ui() -> gr.Blocks:
                 btn_refresh_tx = gr.Button("🔄", variant="secondary", size="sm", scale=0, min_width=40)
             tx_table = gr.Dataframe(
                 value=refresh_portfolio(),
-                label="Portfolio Transactions (prices from TEFAS)",
+                label="Portfolio Transactions",
                 interactive=False,
             )
 
             # Transaction event handlers
-            btn_add_tx.click(handle_add_transaction, inputs=[tx_date, tx_ticker, tx_qty, tx_tax, tx_notes], outputs=[tx_status, tx_table])
+            btn_add_tx.click(handle_add_transaction, inputs=[tx_date, tx_ticker, tx_qty, tx_tax, tx_notes, tx_asset_type, tx_type, tx_buy_price], outputs=[tx_status, tx_table])
             btn_del_tx.click(handle_delete_transaction, inputs=[del_tx_id], outputs=[tx_status, tx_table])
             btn_refresh_tx.click(refresh_portfolio, outputs=[tx_table])
 
-        # ============== TAB 2: OFFICIAL CPI (TCMB) ==============
-        with gr.Tab("📊 CPI (TCMB)"):
+        # ============== TAB 2: DATA MANAGEMENT ==============
+        with gr.Tab("📊 Data Management"):
             gr.Markdown(
                 """
-                ### Official CPI Data from Turkish Central Bank (TCMB)
+                ### Manage CPI, USD Rates, US Stocks, and TEFAS Stocks Data
                 
-                Enter monthly CPI data from [TCMB Consumer Prices](https://www.tcmb.gov.tr/wps/wcm/connect/EN/TCMB+EN/Main+Menu/Statistics/Inflation+Data/Consumer+Prices).
-                
-                **YoY** = Year-over-Year inflation rate (e.g., 44.38% for Dec 2024)  
-                **MoM** = Month-over-Month change (e.g., 1.03% for Dec 2024)
+                View and manage all your data sources in one place.
                 """
             )
 
-            with gr.Row():
-                with gr.Column(scale=2):
-                    gr.Markdown("#### Add Monthly CPI")
-                    with gr.Row():
-                        cpi_month = gr.Textbox(label="Month (YYYY-MM)", value=datetime.now().strftime("%Y-%m"), max_lines=1)
-                        cpi_yoy = gr.Number(label="YoY Rate (%)", value=0, minimum=0)
-                        cpi_mom = gr.Number(label="MoM Rate (%)", value=0)
-                    cpi_notes = gr.Textbox(label="Notes (optional)", max_lines=1)
+            # CPI Section
+            with gr.Accordion("📊 CPI (TCMB)", open=True):
+                gr.Markdown(
+                    """
+                    **Official CPI Data from Turkish Central Bank (TCMB)**
+                    
+                    **YoY** = Year-over-Year inflation rate (e.g., 44.38% for Dec 2024)  
+                    **MoM** = Month-over-Month change (e.g., 1.03% for Dec 2024)
+                    """
+                )
 
-                    with gr.Row():
-                        btn_add_cpi = gr.Button("💾 Save CPI Data", variant="primary")
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        gr.Markdown("#### Add Monthly CPI")
+                        with gr.Row():
+                            cpi_month = gr.Textbox(label="Month (YYYY-MM)", value=datetime.now().strftime("%Y-%m"), max_lines=1)
+                            cpi_yoy = gr.Number(label="YoY Rate (%)", value=0, minimum=0)
+                            cpi_mom = gr.Number(label="MoM Rate (%)", value=0)
+                        cpi_notes = gr.Textbox(label="Notes (optional)", max_lines=1)
 
-                with gr.Column(scale=1):
-                    gr.Markdown("#### Delete Entry")
-                    del_cpi_id = gr.Number(label="CPI ID to Delete", value=0, minimum=0)
-                    btn_del_cpi = gr.Button("🗑️ Delete", variant="secondary")
+                        with gr.Row():
+                            btn_add_cpi = gr.Button("💾 Save CPI Data", variant="primary")
 
-            cpi_status = gr.Textbox(label="Status", interactive=False)
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### Delete Entry")
+                        del_cpi_id = gr.Number(label="CPI ID to Delete", value=0, minimum=0)
+                        btn_del_cpi = gr.Button("🗑️ Delete", variant="secondary")
+
+                cpi_status = gr.Textbox(label="Status", interactive=False)
+
+                with gr.Accordion("📥 Bulk Import CPI Data (CSV)", open=False):
+                    gr.Markdown(
+                        """
+                        Paste CSV data from TCMB in format: `month,yoy,mom` (one per line)
+                        
+                        Supports both `MM-YYYY` and `YYYY-MM` formats.
+                        """
+                    )
+                    bulk_cpi_csv = gr.Textbox(label="CSV Data", placeholder="12-2024,44.38,1.03\n11-2024,47.09,2.24", lines=5)
+                    btn_bulk_import_cpi = gr.Button("📥 Import All", variant="primary")
+
+                with gr.Accordion("🔄 Refresh - CSV Import", open=False):
+                    gr.Markdown(
+                        """
+                        **Import CPI data from CSV**
+                        
+                        Paste CSV data from TCMB in format: `month,yoy,mom` (one per line)
+                        Supports both `MM-YYYY` and `YYYY-MM` formats.
+                        """
+                    )
+                    refresh_cpi_csv = gr.Textbox(label="CSV Data", placeholder="12-2024,44.38,1.03\n11-2024,47.09,2.24", lines=5)
+                    btn_refresh_cpi_csv = gr.Button("📥 Import CPI CSV", variant="primary")
+                    refresh_cpi_status = gr.Textbox(label="Status", interactive=False, lines=3)
+
+                gr.Markdown("### Stored CPI Data")
+                cpi_table = gr.Dataframe(
+                    value=refresh_cpi(),
+                    label="Official CPI Data (TCMB)",
+                    interactive=False,
+                )
+                btn_refresh_cpi = gr.Button("🔄 Refresh Table")
+
+                # CPI event handlers
+                btn_add_cpi.click(handle_add_cpi, inputs=[cpi_month, cpi_yoy, cpi_mom, cpi_notes], outputs=[cpi_status, cpi_table])
+                btn_del_cpi.click(handle_delete_cpi, inputs=[del_cpi_id], outputs=[cpi_status, cpi_table])
+                btn_bulk_import_cpi.click(handle_bulk_import_cpi, inputs=[bulk_cpi_csv], outputs=[cpi_status, cpi_table])
+                btn_refresh_cpi_csv.click(handle_refresh_cpi_csv, inputs=[refresh_cpi_csv], outputs=[refresh_cpi_status, cpi_table])
+                btn_refresh_cpi.click(refresh_cpi, outputs=[cpi_table])
 
             gr.Markdown("---")
 
-            with gr.Accordion("📥 Bulk Import CPI Data (CSV)", open=False):
+            # USD Rates Section
+            with gr.Accordion("💵 USD/TRY Rates", open=True):
                 gr.Markdown(
                     """
-                    Paste CSV data from TCMB in format: `month,yoy,mom` (one per line)
+                    **USD/TRY Exchange Rates (Inflation Proxy)**
                     
-                    Supports both `MM-YYYY` and `YYYY-MM` formats.
-                    
-                    **Recent TCMB Data (copy & paste):**
-                    ```
-                    12-2024,44.38,1.03
-                    11-2024,47.09,2.24
-                    10-2024,48.58,2.88
-                    09-2024,49.38,2.97
-                    08-2024,51.97,2.47
-                    07-2024,61.78,3.23
-                    06-2024,71.60,1.64
-                    05-2024,75.45,3.37
-                    04-2024,69.80,3.18
-                    03-2024,68.50,3.16
-                    02-2024,67.07,4.53
-                    01-2024,64.86,6.70
-                    ```
+                    The "street method" uses USD/TRY exchange rate changes as an inflation proxy.
                     """
                 )
-                bulk_cpi_csv = gr.Textbox(label="CSV Data", placeholder="12-2024,44.38,1.03\n11-2024,47.09,2.24", lines=5)
-                btn_bulk_import_cpi = gr.Button("📥 Import All", variant="primary")
 
-            gr.Markdown("### Stored CPI Data")
-            cpi_table = gr.Dataframe(
-                value=refresh_cpi(),
-                label="Official CPI Data (TCMB)",
-                interactive=False,
-            )
-            btn_refresh_cpi = gr.Button("🔄 Refresh Table")
-
-            # CPI event handlers
-            btn_add_cpi.click(handle_add_cpi, inputs=[cpi_month, cpi_yoy, cpi_mom, cpi_notes], outputs=[cpi_status, cpi_table])
-            btn_del_cpi.click(handle_delete_cpi, inputs=[del_cpi_id], outputs=[cpi_status, cpi_table])
-            btn_bulk_import_cpi.click(handle_bulk_import_cpi, inputs=[bulk_cpi_csv], outputs=[cpi_status, cpi_table])
-            btn_refresh_cpi.click(refresh_cpi, outputs=[cpi_table])
-
-        # ============== TAB 3: USD/TRY RATES ==============
-        with gr.Tab("💵 USD Rates"):
-            gr.Markdown(
-                """
-                ### USD/TRY Exchange Rates (Inflation Proxy)
-                
-                The "street method" uses USD/TRY exchange rate changes as an inflation proxy.
-                Click the button below to fetch all historical rates needed for your portfolio.
-                """
-            )
-
-            with gr.Row():
-                with gr.Column(scale=2):
-                    btn_quick_refresh_usd = gr.Button(
-                        "⚡ Quick Refresh",
-                        variant="primary",
-                        size="lg",
-                    )
-                    gr.Markdown(
-                        "*Fetches only missing rates (from latest stored date to today). Fast!*",
-                    )
-                with gr.Column(scale=2):
-                    btn_refresh_all_usd = gr.Button(
-                        "🔄 Full Refresh",
-                        variant="secondary",
-                        size="lg",
-                    )
-                    gr.Markdown(
-                        "*Fetches all rates from earliest transaction to today. Use if gaps exist.*",
-                    )
-                with gr.Column(scale=1):
-                    gr.Markdown("#### Delete Rate")
-                    del_rate_id = gr.Number(label="Rate ID", value=0, minimum=0)
-                    btn_del_rate = gr.Button("🗑️ Delete", variant="secondary")
-
-            rate_status = gr.Textbox(label="Status", interactive=False, lines=4)
-
-            gr.Markdown("### Stored USD/TRY Rates")
-            rate_table = gr.Dataframe(
-                value=refresh_rates(),
-                label="USD/TRY Rates (from Yahoo Finance)",
-                interactive=False,
-            )
-
-            with gr.Accordion("📥 Manual Entry (Advanced)", open=False):
-                gr.Markdown("*Use this only if you need to add rates manually for dates not covered by Yahoo Finance.*")
                 with gr.Row():
-                    rate_date = gr.DateTime(label="Rate Date", value=datetime.now(), type="string", include_time=False)
-                    rate_value = gr.Number(label="USD/TRY Rate", value=0, minimum=0, precision=4)
-                rate_notes = gr.Textbox(label="Notes (optional)", max_lines=1)
-                with gr.Row():
-                    btn_add_rate = gr.Button("💾 Save Rate", variant="secondary")
-                    btn_fetch_rate = gr.Button("🌐 Fetch Single Date", variant="secondary")
+                    with gr.Column(scale=2):
+                        btn_quick_refresh_usd = gr.Button(
+                            "⚡ Quick Refresh",
+                            variant="primary",
+                            size="lg",
+                        )
+                        gr.Markdown(
+                            "*Fetches only missing rates (from latest stored date to today). Fast!*",
+                        )
+                    with gr.Column(scale=2):
+                        btn_refresh_all_usd = gr.Button(
+                            "🔄 Full Refresh",
+                            variant="secondary",
+                            size="lg",
+                        )
+                        gr.Markdown(
+                            "*Fetches all rates from earliest transaction to today. Use if gaps exist.*",
+                        )
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### Delete Rate")
+                        del_rate_id = gr.Number(label="Rate ID", value=0, minimum=0)
+                        btn_del_rate = gr.Button("🗑️ Delete", variant="secondary")
 
-            with gr.Accordion("📥 Bulk Import (CSV)", open=False):
+                rate_status = gr.Textbox(label="Status", interactive=False, lines=4)
+
+                with gr.Accordion("🔄 Refresh - API Check", open=False):
+                    gr.Markdown(
+                        """
+                        **Refresh USD/TRY exchange rates from yfinance**
+                        
+                        - **Quick Check**: Updates from latest stored date to today
+                        - **Long Check**: Ensures 5 years of history (fetches 5 years if no entry exists)
+                        """
+                    )
+                    with gr.Row():
+                        btn_quick_check_usdtry = gr.Button("⚡ Quick Check USDTRY", variant="primary", size="lg")
+                        btn_long_check_usdtry = gr.Button("🔄 Long Check USDTRY", variant="secondary", size="lg")
+                    usdtry_status = gr.Textbox(label="Status", interactive=False, lines=4)
+
+                gr.Markdown("### Stored USD/TRY Rates")
+                rate_table = gr.Dataframe(
+                    value=refresh_rates(),
+                    label="USD/TRY Rates (from Yahoo Finance)",
+                    interactive=False,
+                )
+
+                with gr.Accordion("📥 Manual Entry (Advanced)", open=False):
+                    gr.Markdown("*Use this only if you need to add rates manually for dates not covered by Yahoo Finance.*")
+                    with gr.Row():
+                        rate_date = gr.DateTime(label="Rate Date", value=datetime.now(), type="string", include_time=False)
+                        rate_value = gr.Number(label="USD/TRY Rate", value=0, minimum=0, precision=4)
+                    rate_notes = gr.Textbox(label="Notes (optional)", max_lines=1)
+                    with gr.Row():
+                        btn_add_rate = gr.Button("💾 Save Rate", variant="secondary")
+                        btn_fetch_rate = gr.Button("🌐 Fetch Single Date", variant="secondary")
+
+                with gr.Accordion("📥 Bulk Import (CSV)", open=False):
+                    gr.Markdown(
+                        """
+                        Paste CSV data in format: `date,rate` (one per line)
+                        
+                        Example:
+                        ```
+                        2024-01-01,29.5
+                        2024-02-01,30.2
+                        ```
+                        """
+                    )
+                    bulk_csv = gr.Textbox(label="CSV Data", placeholder="2024-01-01,29.5\n2024-02-01,30.2", lines=3)
+                    btn_bulk_import = gr.Button("📥 Import", variant="secondary")
+
+                # Rate event handlers
+                btn_quick_refresh_usd.click(handle_quick_refresh_usd_rates, outputs=[rate_status, rate_table])
+                btn_refresh_all_usd.click(handle_refresh_all_usd_rates, outputs=[rate_status, rate_table])
+                btn_quick_check_usdtry.click(handle_quick_check_usdtry, outputs=[usdtry_status, rate_table])
+                btn_long_check_usdtry.click(handle_long_check_usdtry, outputs=[usdtry_status, rate_table])
+                btn_add_rate.click(handle_add_rate, inputs=[rate_date, rate_value, rate_notes], outputs=[rate_status, rate_table])
+                btn_fetch_rate.click(handle_fetch_rate, inputs=[rate_date], outputs=[rate_status, rate_table])
+                btn_del_rate.click(handle_delete_rate, inputs=[del_rate_id], outputs=[rate_status, rate_table])
+                btn_bulk_import.click(handle_bulk_import, inputs=[bulk_csv], outputs=[rate_status, rate_table])
+
+            # US Stocks Section
+            with gr.Accordion("📈 US Stocks", open=True):
                 gr.Markdown(
                     """
-                    Paste CSV data in format: `date,rate` (one per line)
+                    **US Stock Prices**
                     
-                    Example:
-                    ```
-                    2024-01-01,29.5
-                    2024-02-01,30.2
-                    ```
+                    Manage and refresh US stock price data from yfinance.
                     """
                 )
-                bulk_csv = gr.Textbox(label="CSV Data", placeholder="2024-01-01,29.5\n2024-02-01,30.2", lines=3)
-                btn_bulk_import = gr.Button("📥 Import", variant="secondary")
 
-            # Rate event handlers
-            btn_quick_refresh_usd.click(handle_quick_refresh_usd_rates, outputs=[rate_status, rate_table])
-            btn_refresh_all_usd.click(handle_refresh_all_usd_rates, outputs=[rate_status, rate_table])
-            btn_add_rate.click(handle_add_rate, inputs=[rate_date, rate_value, rate_notes], outputs=[rate_status, rate_table])
-            btn_fetch_rate.click(handle_fetch_rate, inputs=[rate_date], outputs=[rate_status, rate_table])
-            btn_del_rate.click(handle_delete_rate, inputs=[del_rate_id], outputs=[rate_status, rate_table])
-            btn_bulk_import.click(handle_bulk_import, inputs=[bulk_csv], outputs=[rate_status, rate_table])
+                with gr.Accordion("🔄 Refresh - API Check", open=False):
+                    gr.Markdown(
+                        """
+                        **Refresh US stock prices from yfinance**
+                        
+                        Updates prices for all US stocks in your portfolio.
+                        - **Quick Check**: Updates from latest stored date to today
+                        - **Long Check**: Ensures 5 years of history (fetches 5 years if no entry exists)
+                        """
+                    )
+                    with gr.Row():
+                        btn_quick_check_us_stocks = gr.Button("⚡ Quick Check US Stocks", variant="primary", size="lg")
+                        btn_long_check_us_stocks = gr.Button("🔄 Long Check US Stocks", variant="secondary", size="lg")
+                    us_stocks_status = gr.Textbox(label="Status", interactive=False, lines=4)
+                    us_stocks_table = gr.Dataframe(
+                        value=pd.DataFrame(),
+                        label="US Stocks Status",
+                        interactive=False,
+                    )
+                    btn_quick_check_us_stocks.click(handle_quick_check_us_stocks, outputs=[us_stocks_status, us_stocks_table])
+                    btn_long_check_us_stocks.click(handle_long_check_us_stocks, outputs=[us_stocks_status, us_stocks_table])
 
-        # ============== TAB 4: ANALYSIS ==============
+            gr.Markdown("---")
+
+            # TEFAS Stocks Section
+            with gr.Accordion("🏦 TEFAS Stocks", open=True):
+                gr.Markdown(
+                    """
+                    **TEFAS Fund Prices**
+                    
+                    Manage and refresh TEFAS fund price data from crawler.
+                    """
+                )
+
+                with gr.Accordion("🔄 Refresh - API Check", open=False):
+                    gr.Markdown(
+                        """
+                        **Refresh TEFAS fund prices from crawler**
+                        
+                        Updates prices for all TEFAS funds in your portfolio.
+                        - **Quick Check**: Updates from latest stored date to today
+                        - **Long Check**: Ensures 5 years of history (fetches 5 years if no entry exists)
+                        """
+                    )
+                    with gr.Row():
+                        btn_quick_check_tefas = gr.Button("⚡ Quick Check TEFAS", variant="primary", size="lg")
+                        btn_long_check_tefas = gr.Button("🔄 Long Check TEFAS", variant="secondary", size="lg")
+                    tefas_status = gr.Textbox(label="Status", interactive=False, lines=4)
+                    tefas_table = gr.Dataframe(
+                        value=pd.DataFrame(),
+                        label="TEFAS Stocks Status",
+                        interactive=False,
+                    )
+                    btn_quick_check_tefas.click(handle_quick_check_tefas, outputs=[tefas_status, tefas_table])
+                    btn_long_check_tefas.click(handle_long_check_tefas, outputs=[tefas_status, tefas_table])
+
+        # ============== TAB 3: ANALYSIS ==============
         with gr.Tab("📈 Analyze Returns"):
             gr.Markdown(
                 """
@@ -262,21 +369,21 @@ def create_ui() -> gr.Blocks:
             with gr.Row():
                 price_table = gr.Dataframe(
                     value=get_ticker_price_table(),
-                    label="Enter current prices for each ticker (auto-filled from TEFAS)",
+                    label="Enter current prices for each ticker (auto-filled from price data)",
                     interactive=True,
-                    column_count=(2, "fixed"),
+                    column_count=(3, "fixed"),
                     scale=2,
                 )
                 with gr.Column(scale=1):
                     btn_refresh_tickers = gr.Button("🔄 Refresh Tickers", variant="secondary")
-                    btn_refresh_tefas = gr.Button("📈 Update TEFAS Prices", variant="secondary")
+                    btn_refresh_prices = gr.Button("📈 Update Prices", variant="secondary")
                     auto_fetch_chk = gr.Checkbox(label="Auto-fetch missing USD rates", value=True, info="Fetches from Yahoo Finance")
 
-            tefas_status = gr.Textbox(label="TEFAS Update Status", interactive=False, visible=True)
+            price_status = gr.Textbox(label="Price Update Status", interactive=False, visible=True)
             btn_calc = gr.Button("🧮 Calculate Real Gains", variant="primary", size="lg")
 
             btn_refresh_tickers.click(get_ticker_price_table, outputs=[price_table])
-            btn_refresh_tefas.click(handle_refresh_tefas_prices, outputs=[tefas_status, price_table])
+            btn_refresh_prices.click(handle_refresh_prices, outputs=[price_status, price_table])
 
             calc_status = gr.Textbox(label="Calculation Status", interactive=False)
 
@@ -296,20 +403,25 @@ def create_ui() -> gr.Blocks:
                 """
                 ---
                 **Legend:**
+                - 📈 **OPEN** = Unsold position (unrealized gains)
+                - ✅ **SOLD** = Closed position (realized gains via FIFO)
                 - 🟢 Positive real return (beat inflation)
                 - 🔴 Negative real return (inflation won)
                 - **Tax** = Tax rate on TRY gains at sell
                 - **Nominal** = After-tax nominal return
-                - **P/L** = Profit/Loss (nominal, in TRY)
+                - **Unreal P/L** = Unrealized Profit/Loss (open positions)
+                - **Realized** = Realized Profit/Loss from sales (FIFO)
                 - **Real (USD)** = Weighted average real return vs USD (after tax)
                 - **Real (CPI)** = Weighted average real return vs official CPI (after tax)
+                
+                **FIFO (First In, First Out):** When you sell, the oldest buy lots are matched first.
                 """
             )
 
             # Analysis event handlers
             btn_calc.click(analyze_portfolio, inputs=[price_table, auto_fetch_chk], outputs=[out_table, summary_table, calc_status])
 
-        # ============== TAB 5: FUND CHARTS ==============
+        # ============== TAB 4: FUND CHARTS ==============
         with gr.Tab("📉 Fund Charts"):
             gr.Markdown(
                 """
@@ -389,7 +501,7 @@ def create_ui() -> gr.Blocks:
                 """
             )
 
-        # ============== TAB 6: HELP ==============
+        # ============== TAB 5: HELP ==============
         with gr.Tab("❓ Help"):
             gr.Markdown(
                 """
@@ -397,10 +509,16 @@ def create_ui() -> gr.Blocks:
                 
                 ### Step 1: Add Your Transactions
                 1. Go to the **📊 Transactions** tab
-                2. Enter the date you bought, TEFAS fund code (e.g., MAC, TI2), and quantity
-                3. **Prices are automatically fetched from TEFAS** - no manual entry needed!
-                4. Optionally set the **Tax Rate** (% of TRY gains taxed at sell)
-                5. Click "Save Transaction"
+                2. Select **Buy** or **Sell** transaction type
+                3. Enter the date, TEFAS fund code (e.g., MAC, TI2), and quantity
+                4. **Prices are automatically fetched from TEFAS** - no manual entry needed!
+                5. Optionally set the **Tax Rate** (% of TRY gains taxed at sell)
+                6. Click "Save Transaction"
+                
+                **Sell Transactions:**
+                - When selling, the system validates you have enough shares
+                - FIFO (First In, First Out) is used to match sells to buys
+                - The oldest lots are sold first, just like real brokerage accounts
                 
                 ### Step 2: Refresh USD/TRY Rates
                 1. Go to the **💵 USD Rates** tab
@@ -450,6 +568,30 @@ def create_ui() -> gr.Blocks:
                 Tax is applied only on **TRY gains** (not losses):
                 - After-tax value = Current Price - (Gain × Tax Rate)
                 - Example: Buy at 0.50, now 0.75, tax 10% → Tax = 0.25 × 10% = 0.025 TRY → After-tax = 0.725 TRY
+                
+                ---
+                
+                ## FIFO Cost Basis Method
+                
+                **FIFO (First In, First Out)** is the standard cost basis method used by Turkish and most international brokerages.
+                
+                **How it works:**
+                1. When you **buy** shares, each purchase becomes a "lot" with its own cost basis
+                2. When you **sell** shares, the **oldest lots are matched first**
+                3. Realized gains/losses are calculated based on the matched lot's original buy price
+                
+                **Example:**
+                - Buy 100 shares @ 10 TRY (Lot 1)
+                - Buy 50 shares @ 15 TRY (Lot 2)
+                - Sell 120 shares @ 20 TRY
+                  - FIFO matches: 100 from Lot 1 + 20 from Lot 2
+                  - Realized gain: (100 × 10) + (20 × 5) = 1,100 TRY
+                  - Remaining: 30 shares from Lot 2 @ 15 TRY
+                
+                **Benefits:**
+                - Accurate cost basis tracking for tax reporting
+                - Separate unrealized (open) and realized (closed) gains
+                - Matches how your broker calculates gains
                 
                 ---
                 

@@ -1,40 +1,35 @@
 """
-TEFAS price fetching module.
+yfinance stock price fetching module.
 
-Fetches historical fund prices from TEFAS (Turkey Electronic Fund Trading Platform)
+Fetches historical stock prices from Yahoo Finance for US stocks
 and stores them in the database. Uses INSERT OR IGNORE to avoid updating existing records.
 """
 
 from datetime import datetime, timedelta
 
-from tefas import Crawler
+import pandas as pd
+import yfinance as yf
 
 from core.database import (
-    CURRENCY_TRY,
+    CURRENCY_USD,
     bulk_add_fund_prices,
     get_fund_price_date_range,
-    get_oldest_fund_price_date,
     get_latest_fund_price,
 )
 
 
-CHUNK_DAYS = 60  # TEFAS API has ~90 day limit, use 60 for safety
-
-
-def fetch_fund_prices(
+def fetch_stock_prices(
     ticker: str,
     start_date: str | None = None,
     end_date: str | None = None,
     years_back: int = 5,
 ) -> tuple[int, int, str]:
     """
-    Fetch fund prices from TEFAS and store in database.
+    Fetch stock prices from Yahoo Finance and store in database.
     Only inserts new records, does not update existing ones.
 
-    Uses chunked requests (60 days at a time) due to TEFAS API limits.
-
     Args:
-        ticker: Fund ticker code (e.g., 'MAC', 'TI2')
+        ticker: Stock ticker symbol (e.g., 'NVDA', 'META', 'BABA', 'QQQ')
         start_date: Start date (YYYY-MM-DD). If None, uses years_back from end_date.
         end_date: End date (YYYY-MM-DD). If None, uses today.
         years_back: How many years back to fetch if start_date is None.
@@ -55,40 +50,25 @@ def fetch_fund_prices(
         start_date = start_dt.strftime("%Y-%m-%d")
 
     try:
-        crawler = Crawler()
+        # Fetch data from yfinance
+        stock = yf.Ticker(ticker)
+        data = stock.history(start=start_date, end=end_date, auto_adjust=True)
 
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        if data.empty:
+            return 0, 0, f"⚠️ No data found for {ticker} between {start_date} and {end_date}"
 
-        total_inserted = 0
-        total_skipped = 0
         all_prices = []
-
-        # Fetch in chunks to avoid API limits
-        current_start = start_dt
-        while current_start < end_dt:
-            current_end = min(current_start + timedelta(days=CHUNK_DAYS), end_dt)
-
-            chunk_start = current_start.strftime("%Y-%m-%d")
-            chunk_end = current_end.strftime("%Y-%m-%d")
-
-            try:
-                data = crawler.fetch(start=chunk_start, end=chunk_end, name=ticker)
-
-                if not data.empty:
-                    for _, row in data.iterrows():
-                        date_str = row["date"].strftime("%Y-%m-%d") if hasattr(row["date"], "strftime") else str(row["date"])
-                        all_prices.append((date_str, ticker, float(row["price"])))
-            except Exception:
-                pass  # Skip failed chunks, continue with others
-
-            current_start = current_end + timedelta(days=1)
+        for date_idx, row in data.iterrows():
+            date_str = date_idx.strftime("%Y-%m-%d")
+            # Use Close price
+            price = float(row["Close"])
+            all_prices.append((date_str, ticker, price))
 
         if not all_prices:
             return 0, 0, f"⚠️ No data found for {ticker} between {start_date} and {end_date}"
 
-        # Bulk insert all collected prices (TEFAS funds are in TRY)
-        inserted, skipped = bulk_add_fund_prices(all_prices, source="tefas", currency=CURRENCY_TRY)
+        # Bulk insert all collected prices with USD currency
+        inserted, skipped = bulk_add_fund_prices(all_prices, source="yfinance", currency=CURRENCY_USD)
 
         return inserted, skipped, f"✅ {ticker}: {inserted} new prices added, {skipped} already existed"
 
@@ -96,13 +76,13 @@ def fetch_fund_prices(
         return 0, 0, f"❌ Error fetching {ticker}: {e}"
 
 
-def update_fund_prices(ticker: str) -> tuple[int, int, str]:
+def update_stock_prices(ticker: str) -> tuple[int, int, str]:
     """
-    Update prices for a fund - only fetches missing recent data.
+    Update prices for a stock - only fetches missing recent data.
     Checks the latest stored date and fetches from there to today.
 
     Args:
-        ticker: Fund ticker code
+        ticker: Stock ticker symbol
 
     Returns:
         Tuple of (inserted_count, skipped_count, status_message)
@@ -114,7 +94,7 @@ def update_fund_prices(ticker: str) -> tuple[int, int, str]:
 
     if latest is None:
         # No data exists, fetch full history
-        return fetch_fund_prices(ticker, end_date=today)
+        return fetch_stock_prices(ticker, end_date=today)
 
     latest_date, _, _ = latest
 
@@ -127,23 +107,22 @@ def update_fund_prices(ticker: str) -> tuple[int, int, str]:
     start_dt = datetime.strptime(latest_date, "%Y-%m-%d") + timedelta(days=1)
     start_date = start_dt.strftime("%Y-%m-%d")
 
-    inserted, skipped, msg = fetch_fund_prices(ticker, start_date=start_date, end_date=today)
+    inserted, skipped, msg = fetch_stock_prices(ticker, start_date=start_date, end_date=today)
 
     # If no new data found but we have existing data, consider it up to date
-    # (could be weekend/holiday or market hasn't closed yet)
     if inserted == 0 and skipped == 0 and "No data found" in msg:
         return 0, 0, f"✅ {ticker} is up to date (latest: {latest_date})"
 
     return inserted, skipped, msg
 
 
-def fetch_prices_for_new_ticker(ticker: str, transaction_date: str) -> tuple[int, int, str]:
+def fetch_prices_for_new_stock(ticker: str, transaction_date: str) -> tuple[int, int, str]:
     """
-    Fetch historical prices for a newly added ticker.
-    Fetches from 5 years before the transaction date (or fund inception) to today.
+    Fetch historical prices for a newly added stock.
+    Fetches from 5 years before the transaction date (or stock inception) to today.
 
     Args:
-        ticker: Fund ticker code
+        ticker: Stock ticker symbol
         transaction_date: The transaction date (YYYY-MM-DD)
 
     Returns:
@@ -159,35 +138,33 @@ def fetch_prices_for_new_ticker(ticker: str, transaction_date: str) -> tuple[int
         oldest, newest = existing_range
         # If transaction date is within existing range or after, just update to today
         if transaction_date >= oldest:
-            return update_fund_prices(ticker)
+            return update_stock_prices(ticker)
         else:
             # Need to fetch older data before the transaction
-            # Fetch from 1 year before transaction to oldest existing
             start_dt = datetime.strptime(transaction_date, "%Y-%m-%d") - timedelta(days=365)
             start_date = start_dt.strftime("%Y-%m-%d")
-            return fetch_fund_prices(ticker, start_date=start_date, end_date=oldest)
+            return fetch_stock_prices(ticker, start_date=start_date, end_date=oldest)
 
     # No existing data - fetch from 5 years back to today
     tx_dt = datetime.strptime(transaction_date, "%Y-%m-%d")
     start_dt = tx_dt - timedelta(days=365 * 5)
     start_date = start_dt.strftime("%Y-%m-%d")
 
-    return fetch_fund_prices(ticker, start_date=start_date, end_date=today)
+    return fetch_stock_prices(ticker, start_date=start_date, end_date=today)
 
 
-def get_current_price(ticker: str) -> float | None:
+def get_current_stock_price(ticker: str) -> float | None:
     """
-    Get the most recent price for a fund.
-    First tries the database, then fetches from TEFAS if not recent enough.
+    Get the most recent price for a stock.
+    First tries the database, then fetches from yfinance if not recent enough.
 
     Args:
-        ticker: Fund ticker code
+        ticker: Stock ticker symbol
 
     Returns:
         Current price or None if not available
     """
     ticker = ticker.upper().strip()
-    today = datetime.now().strftime("%Y-%m-%d")
 
     latest = get_latest_fund_price(ticker)
 
@@ -199,29 +176,51 @@ def get_current_price(ticker: str) -> float | None:
             return price
 
     # Try to fetch fresh data
-    inserted, _, _ = update_fund_prices(ticker)
+    inserted, _, _ = update_stock_prices(ticker)
 
     # Get the updated latest price
     latest = get_latest_fund_price(ticker)
     return latest[1] if latest else None
 
 
-def is_valid_tefas_fund(ticker: str) -> bool:
+def is_valid_stock(ticker: str) -> bool:
     """
-    Check if a ticker is a valid TEFAS fund by attempting to fetch recent data.
+    Check if a ticker is a valid stock by attempting to fetch recent data.
 
     Args:
-        ticker: Fund ticker code to validate
+        ticker: Stock ticker to validate
 
     Returns:
-        True if valid TEFAS fund, False otherwise
+        True if valid stock, False otherwise
     """
     try:
-        crawler = Crawler()
-        today = datetime.now().strftime("%Y-%m-%d")
-        week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-
-        data = crawler.fetch(start=week_ago, end=today, name=ticker.upper().strip())
-        return not data.empty
+        stock = yf.Ticker(ticker.upper().strip())
+        info = stock.info
+        # Check if we have valid price data
+        return info.get("regularMarketPrice") is not None or info.get("previousClose") is not None
     except Exception:
         return False
+
+
+def get_stock_info(ticker: str) -> dict | None:
+    """
+    Get basic info about a stock.
+
+    Args:
+        ticker: Stock ticker symbol
+
+    Returns:
+        Dict with stock info or None if not found
+    """
+    try:
+        stock = yf.Ticker(ticker.upper().strip())
+        info = stock.info
+        return {
+            "ticker": ticker.upper(),
+            "name": info.get("shortName") or info.get("longName", ticker),
+            "currency": info.get("currency", "USD"),
+            "exchange": info.get("exchange", ""),
+            "current_price": info.get("regularMarketPrice") or info.get("previousClose"),
+        }
+    except Exception:
+        return None
