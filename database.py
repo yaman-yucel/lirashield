@@ -22,7 +22,6 @@ def init_db() -> None:
     c = conn.cursor()
 
     # Transactions table for portfolio tracking
-    # Note: price is NOT stored here - it's looked up from fund_prices table
     c.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
