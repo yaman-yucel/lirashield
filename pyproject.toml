@@ -1,7 +1,10 @@
 [project]
 name = "delete-portfolio"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-requires-python = ">=3.13"
-dependencies = []
+description = "Turkish Real Return Tracker - Track portfolio returns adjusted for inflation using CPI/USD benchmarks"
+requires-python = ">=3.12"
+dependencies = [
+    "gradio>=5.0.0",
+    "pandas>=2.0.0",
+    "yfinance>=0.2.0",
+]

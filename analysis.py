@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 import yfinance as yf
 
-from database import get_cpi_usd_rate_for_date, add_cpi_usd_rate, calculate_cumulative_cpi
+from database import get_cpi_usd_rate_for_date, add_cpi_usd_rate
 
 
 def fetch_usd_rate_from_yfinance(date_str: str) -> float | None:
