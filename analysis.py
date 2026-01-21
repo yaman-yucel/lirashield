@@ -75,11 +75,20 @@ def get_usd_rate(date_str: str, auto_fetch: bool = False) -> float | None:
     return None
 
 
-def calculate_real_return(buy_price: float, current_price: float, buy_date: str, auto_fetch_usd: bool = False) -> dict[str, float | str | None]:
+def calculate_real_return(
+    buy_price: float,
+    current_price: float,
+    buy_date: str,
+    auto_fetch_usd: bool = False,
+    tax_rate: float = 0,
+) -> dict[str, float | str | None]:
     """
     Calculates Real Return using both USD and CPI as inflation benchmarks.
 
-    Formula: ((Current_Price / Buy_Price) / (1 + inflation)) - 1
+    Formula: ((After_Tax_Current / Buy_Price) / (1 + inflation)) - 1
+
+    Tax is applied on TRY nominal gain:
+        after_tax_current = current_price - (current_price - buy_price) * tax_rate
 
     If inflation is 20% and your stock rose 20%, your Real Gain is 0%.
 
@@ -88,16 +97,22 @@ def calculate_real_return(buy_price: float, current_price: float, buy_date: str,
         current_price: Current price per share in TRY
         buy_date: Purchase date in YYYY-MM-DD format
         auto_fetch_usd: Whether to auto-fetch USD rates from yfinance
+        tax_rate: Tax rate on TRY gains (0-100, e.g., 10 for 10%)
 
     Returns:
         Dictionary with nominal_pct, usd_inflation_pct, cpi_inflation_pct,
-        real_return_usd_pct, real_return_cpi_pct
+        real_return_usd_pct, real_return_cpi_pct (all after-tax)
         or error message if data is missing
     """
     current_date = datetime.now().strftime("%Y-%m-%d")
 
-    # Calculate nominal return
-    nominal_return = (current_price - buy_price) / buy_price
+    # Calculate after-tax current price (tax only applies to gains)
+    try_gain = max(0, current_price - buy_price)  # Only tax gains, not losses
+    tax_amount = try_gain * (tax_rate / 100)
+    after_tax_current = current_price - tax_amount
+
+    # Calculate nominal return (after tax)
+    nominal_return = (after_tax_current - buy_price) / buy_price
 
     result: dict[str, float | str | None] = {
         "nominal_pct": round(nominal_return * 100, 2),
@@ -107,6 +122,8 @@ def calculate_real_return(buy_price: float, current_price: float, buy_date: str,
         "real_return_cpi_pct": None,
         "buy_usd": None,
         "current_usd": None,
+        "tax_rate": tax_rate,
+        "tax_amount_per_share": round(tax_amount, 4) if tax_rate > 0 else None,
     }
 
     # === USD-based calculation ===
@@ -145,7 +162,7 @@ def calculate_portfolio_summary(positions: list[dict], auto_fetch_usd: bool = Fa
     Calculate aggregate portfolio metrics.
 
     Args:
-        positions: List of position dicts with buy_price, current_price, buy_date, quantity
+        positions: List of position dicts with buy_price, current_price, buy_date, quantity, tax_rate
         auto_fetch_usd: Whether to auto-fetch USD rates
 
     Returns:
@@ -160,6 +177,7 @@ def calculate_portfolio_summary(positions: list[dict], auto_fetch_usd: bool = Fa
         qty = pos.get("quantity", 1)
         buy_price = pos["buy_price"]
         current_price = pos["current_price"]
+        tax_rate = pos.get("tax_rate", 0)
 
         invested = buy_price * qty
         current = current_price * qty
@@ -167,7 +185,7 @@ def calculate_portfolio_summary(positions: list[dict], auto_fetch_usd: bool = Fa
         total_invested += invested
         current_value += current
 
-        result = calculate_real_return(buy_price, current_price, pos["buy_date"], auto_fetch_usd)
+        result = calculate_real_return(buy_price, current_price, pos["buy_date"], auto_fetch_usd, tax_rate)
         if result.get("real_return_usd_pct") is not None:
             weighted_real_gains_usd.append((invested, result["real_return_usd_pct"]))
         if result.get("real_return_cpi_pct") is not None:

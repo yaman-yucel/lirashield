@@ -24,8 +24,12 @@ from database import (
     delete_cpi_official,
     bulk_import_cpi_official,
     get_unique_tickers,
+    get_all_fund_latest_prices,
+    get_fund_price_date_range,
+    get_fund_prices,
 )
 from analysis import calculate_real_return, fetch_usd_rate_from_yfinance, get_usd_rate
+from tefas_fetcher import fetch_prices_for_new_ticker, update_fund_prices
 
 # Initialize database on startup
 init_db()
@@ -34,19 +38,43 @@ init_db()
 # ============== TRANSACTION HANDLERS ==============
 
 
-def handle_add_transaction(date: str, ticker: str, qty: float, price: float, notes: str):
-    """Handle adding a new transaction."""
+def handle_add_transaction(date: str, ticker: str, qty: float, tax_rate: float, notes: str):
+    """Handle adding a new transaction. Price is auto-fetched from TEFAS."""
     if not ticker.strip():
         return "❌ Ticker is required", get_portfolio()
     if qty <= 0:
         return "❌ Quantity must be positive", get_portfolio()
-    if price <= 0:
-        return "❌ Price must be positive", get_portfolio()
+    if tax_rate < 0 or tax_rate > 100:
+        return "❌ Tax rate must be between 0 and 100", get_portfolio()
 
     # DateTime with type="string" returns "YYYY-MM-DD HH:MM:SS", extract date part
     date_str = str(date)[:10] if date else datetime.now().strftime("%Y-%m-%d")
+    ticker_upper = ticker.upper().strip()
 
-    result = add_transaction(date_str, ticker, qty, price, notes)
+    # First, ensure we have TEFAS prices for this ticker
+    existing_range = get_fund_price_date_range(ticker_upper)
+    tefas_status = ""
+
+    if existing_range is None:
+        # New ticker - fetch historical prices first
+        try:
+            inserted, skipped, tefas_msg = fetch_prices_for_new_ticker(ticker_upper, date_str)
+            if inserted > 0:
+                tefas_status = f"📈 TEFAS: {inserted} prices fetched"
+            elif "No data found" in tefas_msg or (inserted == 0 and skipped == 0):
+                return f"❌ {ticker_upper} is not a valid TEFAS fund. Cannot add transaction.", get_portfolio()
+        except Exception as e:
+            return f"❌ Failed to fetch TEFAS prices: {e}", get_portfolio()
+    else:
+        # Update prices to ensure we have the latest
+        update_fund_prices(ticker_upper)
+
+    # add_transaction will look up the price from fund_prices
+    result = add_transaction(date_str, ticker_upper, qty, tax_rate, notes)
+
+    if result.startswith("✅") and tefas_status:
+        result += f"\n{tefas_status}"
+
     return result, get_portfolio()
 
 
@@ -136,6 +164,54 @@ def refresh_cpi():
     return get_cpi_official_data()
 
 
+# ============== TEFAS PRICE HANDLERS ==============
+
+
+def handle_refresh_tefas_prices():
+    """Refresh TEFAS prices for all tickers in portfolio."""
+    tickers = get_unique_tickers()
+    if not tickers:
+        return "❌ No tickers in portfolio", pd.DataFrame({"Ticker": ["No tickers"], "Current Price": [0.0]})
+
+    results = []
+    total_inserted = 0
+
+    for ticker in tickers:
+        try:
+            inserted, skipped, msg = update_fund_prices(ticker)
+            total_inserted += inserted
+            if inserted > 0:
+                results.append(f"✅ {ticker}: +{inserted} prices")
+            elif "up to date" in msg.lower():
+                results.append(f"✓ {ticker}: up to date")
+            elif "No data found" in msg:
+                # Only mark as "not a TEFAS fund" if we have zero historical data
+                existing = get_fund_prices(ticker)
+                if existing.empty:
+                    results.append(f"⚠️ {ticker}: not a TEFAS fund")
+                else:
+                    results.append(f"✓ {ticker}: up to date ({len(existing)} prices stored)")
+            else:
+                results.append(f"⚠️ {ticker}: {msg}")
+        except Exception as e:
+            results.append(f"❌ {ticker}: {e}")
+
+    # Get updated price table
+    latest_prices = get_all_fund_latest_prices()
+    prices = []
+    for t in tickers:
+        if t in latest_prices:
+            _, price = latest_prices[t]
+            prices.append(price)
+        else:
+            prices.append(0.0)
+
+    price_table = pd.DataFrame({"Ticker": tickers, "Current Price": prices})
+    status = f"📈 Updated {total_inserted} prices\n" + "\n".join(results)
+
+    return status, price_table
+
+
 # ============== ANALYSIS HANDLERS ==============
 
 
@@ -175,6 +251,9 @@ def analyze_portfolio(price_table_df: pd.DataFrame, auto_fetch: bool):
         buy_price = row["price_per_share"]
         buy_date = row["date"]
         quantity = row["quantity"]
+        # Handle None/NaN - use pd.isna() for proper NaN detection
+        tax_rate_raw = row.get("tax_rate", 0)
+        tax_rate = 0.0 if pd.isna(tax_rate_raw) else float(tax_rate_raw)
         invested = buy_price * quantity
 
         # Get current price (default to buy price if not provided)
@@ -196,7 +275,10 @@ def analyze_portfolio(price_table_df: pd.DataFrame, auto_fetch: bool):
         ticker_summary[ticker]["total_invested"] += invested
         ticker_summary[ticker]["total_current"] += current_value
 
-        analysis = calculate_real_return(buy_price, current_price, buy_date, auto_fetch_usd=auto_fetch)
+        analysis = calculate_real_return(buy_price, current_price, buy_date, auto_fetch_usd=auto_fetch, tax_rate=tax_rate)
+
+        # Show tax with precision to reveal any rounding issues
+        tax_str = f"{tax_rate:.2f}%" if tax_rate > 0 else "0%"
 
         if "error" in analysis:
             errors.append(f"• {ticker} ({buy_date}): {analysis['error']}")
@@ -208,6 +290,7 @@ def analyze_portfolio(price_table_df: pd.DataFrame, auto_fetch: bool):
                     "Qty": quantity,
                     "Buy": f"{buy_price:.4f}",
                     "Now": f"{current_price:.4f}",
+                    "Tax": tax_str,
                     "Nominal": "—",
                     "USD Δ": "—",
                     "CPI Δ": "—",
@@ -260,6 +343,7 @@ def analyze_portfolio(price_table_df: pd.DataFrame, auto_fetch: bool):
                     "Qty": quantity,
                     "Buy": f"{buy_price:.4f}",
                     "Now": f"{current_price:.4f}",
+                    "Tax": tax_str,
                     "Nominal": f"{nominal:+.2f}%",
                     "USD Δ": f"{usd_inf:+.2f}%" if usd_inf is not None else "—",
                     "CPI Δ": f"{cpi_inf:+.2f}%" if cpi_inf is not None else "—",
@@ -383,16 +467,21 @@ def create_ui() -> gr.Blocks:
 
         # ============== TAB 1: TRANSACTIONS ==============
         with gr.Tab("📊 Transactions"):
-            gr.Markdown("### Add Buy Transactions")
+            gr.Markdown(
+                """
+                ### Add Buy Transactions
+                *Price is automatically fetched from TEFAS based on the transaction date.*
+                """
+            )
 
             with gr.Row():
                 with gr.Column(scale=2):
                     with gr.Row():
                         tx_date = gr.DateTime(label="Purchase Date", value=datetime.now(), type="string", include_time=False)
-                        tx_ticker = gr.Textbox(label="Ticker / Fund Name", placeholder="e.g., TUPRS, THYAO, MAC", max_lines=1)
+                        tx_ticker = gr.Textbox(label="TEFAS Fund Code", placeholder="e.g., MAC, TI2, AFT", max_lines=1)
                     with gr.Row():
                         tx_qty = gr.Number(label="Quantity", value=1, minimum=0.0001, precision=4)
-                        tx_price = gr.Number(label="Price Paid (TRY)", value=0.0, minimum=0, precision=4)
+                        tx_tax = gr.Number(label="Tax Rate at Sell (%)", value=0, minimum=0, maximum=100, precision=2, info="Tax on TRY gains")
                     tx_notes = gr.Textbox(label="Notes (optional)", placeholder="e.g., Bought on dip", max_lines=1)
 
                     with gr.Row():
@@ -408,13 +497,13 @@ def create_ui() -> gr.Blocks:
             gr.Markdown("### Your Transactions")
             tx_table = gr.Dataframe(
                 value=get_portfolio(),
-                label="Portfolio Transactions",
+                label="Portfolio Transactions (prices from TEFAS)",
                 interactive=False,
             )
             btn_refresh_tx = gr.Button("🔄 Refresh Table")
 
             # Transaction event handlers
-            btn_add_tx.click(handle_add_transaction, inputs=[tx_date, tx_ticker, tx_qty, tx_price, tx_notes], outputs=[tx_status, tx_table])
+            btn_add_tx.click(handle_add_transaction, inputs=[tx_date, tx_ticker, tx_qty, tx_tax, tx_notes], outputs=[tx_status, tx_table])
             btn_del_tx.click(handle_delete_transaction, inputs=[del_tx_id], outputs=[tx_status, tx_table])
             btn_refresh_tx.click(refresh_portfolio, outputs=[tx_table])
 
@@ -571,27 +660,42 @@ def create_ui() -> gr.Blocks:
             gr.Markdown("#### Current Prices")
 
             def get_ticker_price_table():
-                """Generate a table with tickers for price entry."""
+                """Generate a table with tickers for price entry, auto-filled from TEFAS data."""
                 tickers = get_unique_tickers()
                 if not tickers:
                     return pd.DataFrame({"Ticker": ["No tickers"], "Current Price": [0.0]})
-                return pd.DataFrame({"Ticker": tickers, "Current Price": [0.0] * len(tickers)})
+
+                # Get latest prices from database
+                latest_prices = get_all_fund_latest_prices()
+
+                prices = []
+                for t in tickers:
+                    if t in latest_prices:
+                        _, price = latest_prices[t]
+                        prices.append(price)
+                    else:
+                        prices.append(0.0)
+
+                return pd.DataFrame({"Ticker": tickers, "Current Price": prices})
 
             with gr.Row():
                 price_table = gr.Dataframe(
                     value=get_ticker_price_table(),
-                    label="Enter current prices for each ticker",
+                    label="Enter current prices for each ticker (auto-filled from TEFAS)",
                     interactive=True,
                     column_count=(2, "fixed"),
                     scale=2,
                 )
                 with gr.Column(scale=1):
                     btn_refresh_tickers = gr.Button("🔄 Refresh Tickers", variant="secondary")
+                    btn_refresh_tefas = gr.Button("📈 Update TEFAS Prices", variant="secondary")
                     auto_fetch_chk = gr.Checkbox(label="Auto-fetch missing USD rates", value=True, info="Fetches from Yahoo Finance")
 
+            tefas_status = gr.Textbox(label="TEFAS Update Status", interactive=False, visible=True)
             btn_calc = gr.Button("🧮 Calculate Real Gains", variant="primary", size="lg")
 
             btn_refresh_tickers.click(lambda: get_ticker_price_table(), outputs=[price_table])
+            btn_refresh_tefas.click(handle_refresh_tefas_prices, outputs=[tefas_status, price_table])
 
             calc_status = gr.Textbox(label="Calculation Status", interactive=False)
 
@@ -613,9 +717,11 @@ def create_ui() -> gr.Blocks:
                 **Legend:**
                 - 🟢 Positive real return (beat inflation)
                 - 🔴 Negative real return (inflation won)
+                - **Tax** = Tax rate on TRY gains at sell
+                - **Nominal** = After-tax nominal return
                 - **P/L** = Profit/Loss (nominal, in TRY)
-                - **Real (USD)** = Weighted average real return vs USD
-                - **Real (CPI)** = Weighted average real return vs official CPI
+                - **Real (USD)** = Weighted average real return vs USD (after tax)
+                - **Real (CPI)** = Weighted average real return vs official CPI (after tax)
                 """
             )
 
@@ -630,10 +736,12 @@ def create_ui() -> gr.Blocks:
                 
                 ### Step 1: Add Your Transactions
                 1. Go to the **📊 Transactions** tab
-                2. Enter the date you bought, ticker symbol, quantity, and price
-                3. Click "Save Transaction"
+                2. Enter the date you bought, TEFAS fund code (e.g., MAC, TI2), and quantity
+                3. **Prices are automatically fetched from TEFAS** - no manual entry needed!
+                4. Optionally set the **Tax Rate** (% of TRY gains taxed at sell)
+                5. Click "Save Transaction"
                 
-                ### Step 2: Add USD/TRY Rates
+                ### Step 2: Add USD/TRY Rates (for inflation benchmark)
                 1. Go to the **💵 USD Rates** tab
                 2. Add the USD/TRY rate for your buy date(s)
                 3. Add today's USD/TRY rate
@@ -641,31 +749,42 @@ def create_ui() -> gr.Blocks:
                 
                 ### Step 3: Analyze
                 1. Go to the **📈 Analyze Returns** tab
-                2. Enter current prices in the table (one row per ticker)
-                3. Click "Calculate Real Gains"
+                2. Current prices are **auto-filled from TEFAS** data
+                3. Click "Update TEFAS Prices" to refresh latest prices
+                4. Click "Calculate Real Gains"
+                
+                ---
+                
+                ## TEFAS Integration
+                
+                This app automatically fetches fund prices from [TEFAS](https://www.tefas.gov.tr/):
+                - **Buy prices** are looked up based on transaction date
+                - **Current prices** are auto-filled in the analysis tab
+                - Historical data up to 5 years is fetched for new funds
+                
+                **Supported funds:** All funds listed on TEFAS (mutual funds, pension funds, ETFs)
                 
                 ---
                 
                 ## Understanding Real Returns
                 
-                **Nominal Return:** How much your investment went up/down in TRY terms.
+                **Nominal Return:** How much your investment went up/down in TRY terms (after tax).
                 
                 **USD Change:** How much TRY lost value against USD.
                 
-                **Real Return:** Your actual purchasing power gain/loss.
+                **Real Return:** Your actual purchasing power gain/loss (after tax).
                 
-                ### Example
+                ### Tax Calculation
                 
-                - You bought TUPRS at 100 TRY when USD was 30 TRY
-                - Now TUPRS is 150 TRY and USD is 36 TRY
-                - Nominal gain: +50%
-                - USD change: +20% (TRY lost 20% against USD)
-                - Real return: (1.50 / 1.20) - 1 = **+25%**
+                Tax is applied only on **TRY gains** (not losses):
+                - After-tax value = Current Price - (Gain × Tax Rate)
+                - Example: Buy at 0.50, now 0.75, tax 10% → Tax = 0.25 × 10% = 0.025 TRY → After-tax = 0.725 TRY
                 
                 ---
                 
                 ## Data Sources
                 
+                - **Fund Prices**: [TEFAS](https://www.tefas.gov.tr/) (automatic)
                 - **CPI**: [TCMB Consumer Prices](https://www.tcmb.gov.tr/wps/wcm/connect/EN/TCMB+EN/Main+Menu/Statistics/Inflation+Data/Consumer+Prices)
                 - **USD/TRY**: Yahoo Finance (TRY=X ticker)
                 
