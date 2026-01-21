@@ -5,13 +5,68 @@ A Gradio-based portfolio tracker that calculates inflation-adjusted (real) retur
 ## Project Structure
 
 ```
-├── app.py              # Gradio UI and event handlers (main entry point)
-├── database.py         # SQLite database operations and schema
-├── analysis.py         # Real return calculations and inflation adjustments
-├── tefas_fetcher.py    # TEFAS (Turkish fund platform) price fetcher
-├── portfolio.db        # SQLite database (auto-created)
-├── pyproject.toml      # Project dependencies (uv)
-└── uv.lock             # Locked dependencies
+├── app.py                    # Entry point (Gradio UI definition)
+├── core/                     # Core modules
+│   ├── __init__.py
+│   ├── database.py           # Database operations with context manager
+│   └── analysis.py           # Real return calculations, yfinance integration
+├── adapters/                 # External API integrations
+│   ├── __init__.py
+│   └── tefas.py              # TEFAS price fetching
+├── services/                 # Business logic layer
+│   ├── __init__.py
+│   ├── portfolio.py          # Portfolio/transaction operations
+│   ├── rates.py              # USD/CPI rate operations
+│   ├── charts.py             # Chart generation
+│   └── analysis.py           # Portfolio analysis
+├── ui/                       # UI layer
+│   ├── __init__.py
+│   └── handlers/             # Gradio event handlers
+│       ├── __init__.py
+│       ├── transactions.py
+│       ├── rates.py
+│       ├── charts.py
+│       └── analysis.py
+├── portfolio.db              # SQLite database (auto-created)
+├── pyproject.toml            # Project dependencies (uv)
+└── uv.lock                   # Locked dependencies
+```
+
+## Architecture
+
+The application follows a layered architecture:
+
+```
+┌─────────────────────────────────────┐
+│           app.py (Gradio UI)        │
+└─────────────────┬───────────────────┘
+                  │
+┌─────────────────▼───────────────────┐
+│         ui/handlers/ (Event Handlers)│
+└─────────────────┬───────────────────┘
+                  │
+┌─────────────────▼───────────────────┐
+│        services/ (Business Logic)    │
+└─────────────────┬───────────────────┘
+                  │
+        ┌─────────┴─────────┐
+        ▼                   ▼
+┌───────────────┐   ┌───────────────┐
+│ core/database │   │   adapters/   │
+│ core/analysis │   │  (TEFAS, etc) │
+└───────────────┘   └───────────────┘
+```
+
+## Running the Application
+
+```bash
+# Install dependencies
+uv sync
+
+# Run the app
+uv run python app.py
+
+# App launches at http://localhost:7860
 ```
 
 ## Core Concepts
@@ -42,7 +97,6 @@ after_tax_value = current_price - max(0, gain) * tax_rate
 | date | TEXT | Purchase date (YYYY-MM-DD) |
 | ticker | TEXT | TEFAS fund code (e.g., MAC, TI2) |
 | quantity | REAL | Number of shares |
-| price_per_share | REAL | Price from fund_prices table |
 | tax_rate | REAL | Tax rate on TRY gains (0-100) |
 | notes | TEXT | Optional notes |
 
@@ -76,23 +130,25 @@ after_tax_value = current_price - max(0, gain) * tax_rate
 
 ### `app.py` - Gradio UI
 
-**Entry Point**: Run with `uv run app.py`
+**Entry Point**: Run with `uv run python app.py`
 
 **Tabs**:
 1. **Transactions** - Add/delete buy transactions (auto-fetches price from TEFAS)
 2. **CPI (TCMB)** - Add/import official CPI data
 3. **USD Rates** - Add/fetch USD/TRY rates
 4. **Analyze Returns** - Calculate real returns with current prices
-5. **Help** - Usage instructions
+5. **Fund Charts** - View price history in TRY/USD
+6. **Help** - Usage instructions
 
-**Key Functions**:
-- `handle_add_transaction()` - Validates ticker via TEFAS, fetches historical prices, stores transaction
-- `analyze_portfolio()` - Calculates real returns for all transactions
-- `handle_refresh_tefas_prices()` - Updates prices for all portfolio tickers
+### `core/database.py` - Data Layer
 
-### `database.py` - Data Layer
-
-**Connection**: Uses `portfolio.db` SQLite database
+**Connection**: Uses context manager for safe database connections:
+```python
+with get_connection() as conn:
+    c = conn.cursor()
+    c.execute("SELECT * FROM table")
+    # Auto-commits on success, rollbacks on exception, always closes
+```
 
 **Key Functions**:
 - `init_db()` - Creates tables with migrations for existing DBs
@@ -100,12 +156,7 @@ after_tax_value = current_price - max(0, gain) * tax_rate
 - `get_fund_price_for_date(ticker, date, exact_match=False)` - Returns price or closest earlier date
 - `calculate_cumulative_cpi_daily(start_date, end_date)` - Daily-compounded CPI between dates
 
-**Price Lookup Logic**:
-- Exact match preferred
-- Falls back to closest earlier date if `exact_match=False`
-- Returns `None` if no data found
-
-### `analysis.py` - Calculations
+### `core/analysis.py` - Calculations
 
 **Key Functions**:
 - `get_usd_rate(date, auto_fetch=False)` - Gets rate from DB or yfinance
@@ -117,11 +168,7 @@ after_tax_value = current_price - max(0, gain) * tax_rate
   - `real_return_cpi_pct` - Real return vs CPI
   - `error` - Error message if both benchmarks fail
 
-**Auto-fetch Behavior**:
-- When `auto_fetch_usd=True`: Only accepts exact date matches from DB, fetches from yfinance if missing
-- When `auto_fetch_usd=False`: Falls back to closest earlier date in DB
-
-### `tefas_fetcher.py` - TEFAS Integration
+### `adapters/tefas.py` - TEFAS Integration
 
 Uses `tefas-crawler` library to fetch fund prices.
 
@@ -131,14 +178,30 @@ Uses `tefas-crawler` library to fetch fund prices.
 - `fetch_fund_prices(ticker, start_date, end_date)` - Fetches in chunks, bulk inserts
 - `update_fund_prices(ticker)` - Only fetches missing recent data
 - `fetch_prices_for_new_ticker(ticker, tx_date)` - Fetches 5 years history for new tickers
-- `is_valid_tefas_fund(ticker)` - Validates ticker by attempting fetch
+
+### `services/` - Business Logic
+
+Services provide a clean interface between UI handlers and data layer:
+
+- **PortfolioService** - Transaction CRUD, TEFAS price management
+- **RatesService** - USD/TRY and CPI rate management
+- **ChartsService** - Fund price chart generation (TRY/USD)
+- **AnalysisService** - Real return calculations
+
+### `ui/handlers/` - Event Handlers
+
+Thin wrappers that connect Gradio events to services:
+- `transactions.py` - Add/delete transactions
+- `rates.py` - USD and CPI rate management
+- `charts.py` - Chart generation
+- `analysis.py` - Portfolio analysis
 
 ## Data Flow
 
 ### Adding a Transaction
 ```
 1. User enters ticker, date, quantity
-2. handle_add_transaction() checks if ticker exists in fund_prices
+2. PortfolioService.add_transaction() checks if ticker exists in fund_prices
 3. If new ticker: fetch_prices_for_new_ticker() fetches 5 years of history
 4. If existing: update_fund_prices() fetches any missing recent data
 5. add_transaction() looks up price from fund_prices for the date
@@ -148,9 +211,9 @@ Uses `tefas-crawler` library to fetch fund prices.
 ### Calculating Real Returns
 ```
 1. User clicks "Calculate Real Gains"
-2. analyze_portfolio() iterates through transactions
+2. AnalysisService.analyze_portfolio() iterates through transactions
 3. For each transaction:
-   a. get current price from price_table (user can edit)
+   a. Get current price from price_table (user can edit)
    b. calculate_real_return() computes:
       - Gets buy_date USD rate and today's USD rate
       - Gets cumulative CPI between dates
@@ -166,13 +229,13 @@ Uses `tefas-crawler` library to fetch fund prices.
 **Solution**: 
 - Check if ticker is valid TEFAS fund
 - Transaction date might be weekend/holiday - price lookup falls back to earlier date
-- Call `fetch_prices_for_new_ticker()` to fetch historical data
+- Prices are auto-fetched when adding new tickers
 
 ### Issue: "Missing both USD and CPI data for DATE"
 **Cause**: No inflation data available for comparison
 **Solution**:
 - Enable "Auto-fetch missing USD rates" checkbox
-- Manually add USD rates in USD Rates tab
+- Click "Quick Refresh" in USD Rates tab
 - Import CPI data in CPI tab
 
 ### Issue: TEFAS prices not updating
@@ -182,34 +245,16 @@ Uses `tefas-crawler` library to fetch fund prices.
 - Check if market is open
 - Verify ticker is valid TEFAS fund
 
-### Issue: Tax rate shows "0%" but should have value
-**Cause**: `tax_rate` column uses NULL/NaN handling
-**Solution**: Check `pd.isna()` handling in `analyze_portfolio()`:
-```python
-tax_rate = 0.0 if pd.isna(tax_rate_raw) else float(tax_rate_raw)
-```
-
 ## Dependencies
 
 ```toml
 dependencies = [
-    "gradio>=5.0.0",      # Web UI framework
-    "pandas>=2.0.0",      # Data manipulation
+    "gradio>=5.0.0",        # Web UI framework
+    "pandas>=2.0.0",        # Data manipulation
     "tefas-crawler>=0.5.0", # TEFAS price fetcher
-    "yfinance>=0.2.0",    # USD/TRY rate fetcher
+    "yfinance>=0.2.0",      # USD/TRY rate fetcher
+    "plotly>=5.0.0",        # Interactive charts
 ]
-```
-
-## Running the Application
-
-```bash
-# Install dependencies
-uv sync
-
-# Run the app
-uv run app.py
-
-# App launches at http://localhost:7860
 ```
 
 ## Type Hints
@@ -222,6 +267,28 @@ Project uses Python 3.12+ typing:
 
 ## Key Patterns
 
+### Database Context Manager
+```python
+with get_connection() as conn:
+    c = conn.cursor()
+    c.execute("SELECT * FROM table")
+    # Auto-commit on success, rollback on error, always close
+```
+
+### Service Layer Pattern
+```python
+# UI handler (thin)
+def handle_add_transaction(date, ticker, qty, tax, notes):
+    return PortfolioService.add_transaction(date, ticker, qty, tax, notes)
+
+# Service (business logic)
+class PortfolioService:
+    @staticmethod
+    def add_transaction(...):
+        # Validation, TEFAS fetch, DB insert
+        ...
+```
+
 ### Date Handling
 - All dates stored as `YYYY-MM-DD` strings
 - Gradio DateTime returns "YYYY-MM-DD HH:MM:SS", extract first 10 chars: `str(date)[:10]`
@@ -232,18 +299,3 @@ Functions return status strings with emojis:
 - `"✅ Success message"` - Operation succeeded
 - `"❌ Error: message"` - Operation failed
 - `"⚠️ Warning message"` - Partial success or warning
-
-### Database Pattern
-```python
-conn = get_connection()
-c = conn.cursor()
-# ... execute queries ...
-conn.commit()  # for writes
-conn.close()
-```
-
-### Price Fallback Pattern
-When exact date not found, fall back to closest earlier date:
-```python
-c.execute("SELECT price FROM fund_prices WHERE ticker = ? AND date <= ? ORDER BY date DESC LIMIT 1", ...)
-```

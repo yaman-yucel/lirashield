@@ -11,9 +11,10 @@ Falls back to yfinance for automatic USD fetching when manual data is unavailabl
 
 from datetime import datetime, timedelta
 
+import pandas as pd
 import yfinance as yf
 
-from database import get_cpi_usd_rate_for_date, add_cpi_usd_rate, calculate_cumulative_cpi_daily
+from core.database import get_cpi_usd_rate_for_date, add_cpi_usd_rate, calculate_cumulative_cpi_daily, get_cpi_usd_rates
 
 
 def fetch_usd_rate_from_yfinance(date_str: str) -> float | None:
@@ -211,3 +212,197 @@ def calculate_portfolio_summary(positions: list[dict], auto_fetch_usd: bool = Fa
         "avg_real_gain_usd_pct": round(avg_real_gain_usd, 2),
         "avg_real_gain_cpi_pct": round(avg_real_gain_cpi, 2),
     }
+
+
+def fetch_usd_rates_for_date_range(start_date: str, end_date: str) -> tuple[int, str]:
+    """
+    Fetch USD/TRY rates for a date range from yfinance and store in database.
+
+    Args:
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+
+    Returns:
+        Tuple of (count of new rates fetched, status message)
+    """
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)  # Include end date
+
+        # Try USDTRY=X first (has more history), fallback to TRY=X
+        tickers_to_try = ["USDTRY=X", "TRY=X"]
+        data = None
+
+        for ticker in tickers_to_try:
+            try:
+                data = yf.download(
+                    ticker,
+                    start=start_dt.strftime("%Y-%m-%d"),
+                    end=end_dt.strftime("%Y-%m-%d"),
+                    progress=False,
+                    auto_adjust=True,
+                )
+                if not data.empty:
+                    break
+            except Exception:
+                continue
+
+        if data is None or data.empty:
+            return 0, f"❌ No USD/TRY data available for {start_date} to {end_date}"
+
+        # Handle both single and multi-index columns
+        close_col = None
+        if isinstance(data.columns, pd.MultiIndex):
+            # MultiIndex columns - find Close column
+            for ticker in tickers_to_try:
+                if ("Close", ticker) in data.columns:
+                    close_col = data[("Close", ticker)]
+                    break
+        elif "Close" in data.columns:
+            close_col = data["Close"]
+
+        if close_col is None:
+            return 0, "❌ Could not parse USD/TRY data from yfinance"
+
+        # Insert each rate into the database
+        imported = 0
+        for date_idx, rate in close_col.items():
+            if pd.notna(rate):
+                date_str = date_idx.strftime("%Y-%m-%d")
+                result = add_cpi_usd_rate(date_str, float(rate), source="yfinance_batch", notes="Batch fetched")
+                if result.startswith("✅"):
+                    imported += 1
+
+        if imported > 0:
+            return imported, f"✅ Fetched {imported} USD/TRY rates ({start_date} to {end_date})"
+        else:
+            return 0, f"⚠️ All rates already exist for {start_date} to {end_date}"
+
+    except Exception as e:
+        return 0, f"❌ Error fetching USD rates: {e}"
+
+
+def fetch_all_usd_rates() -> tuple[int, int, str]:
+    """
+    Fetch all USD/TRY rates from the earliest needed date to today.
+
+    Determines the earliest date from:
+    - Earliest transaction date
+    - Earliest fund price date
+
+    Returns:
+        Tuple of (new_rates_count, total_rates_count, status_message)
+    """
+    from core.database import get_connection
+
+    # Find the earliest date we need rates for
+    with get_connection() as conn:
+        c = conn.cursor()
+
+        # Get earliest transaction date
+        c.execute("SELECT MIN(date) FROM transactions")
+        earliest_tx = c.fetchone()[0]
+
+        # Get earliest fund price date
+        c.execute("SELECT MIN(date) FROM fund_prices")
+        earliest_fund = c.fetchone()[0]
+
+        # Get current count of rates
+        c.execute("SELECT COUNT(*) FROM cpi_usd_rates")
+        before_count = c.fetchone()[0]
+
+    # Determine the earliest date we need
+    dates = [d for d in [earliest_tx, earliest_fund] if d is not None]
+
+    if not dates:
+        return 0, before_count, "⚠️ No transactions or fund prices found. Add some data first."
+
+    earliest_date = min(dates)
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # Fetch all rates for the date range
+    new_count, fetch_msg = fetch_usd_rates_for_date_range(earliest_date, today)
+
+    # Get updated count
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM cpi_usd_rates")
+        after_count = c.fetchone()[0]
+
+    status_parts = [f"📅 Date range: {earliest_date} → {today}", fetch_msg, f"📊 Total rates in database: {after_count}"]
+
+    return new_count, after_count, "\n".join(status_parts)
+
+
+def fetch_missing_usd_rates() -> tuple[int, int, str]:
+    """
+    Quick refresh: Fetch only missing USD/TRY rates from the latest stored date to today.
+
+    This is faster than fetch_all_usd_rates() as it only fetches recent missing data.
+
+    Returns:
+        Tuple of (new_rates_count, total_rates_count, status_message)
+    """
+    from core.database import get_connection
+
+    with get_connection() as conn:
+        c = conn.cursor()
+
+        # Get the latest date in the database
+        c.execute("SELECT MAX(date) FROM cpi_usd_rates")
+        latest_date = c.fetchone()[0]
+
+        # Get current count
+        c.execute("SELECT COUNT(*) FROM cpi_usd_rates")
+        before_count = c.fetchone()[0]
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if latest_date is None:
+        # No rates in database, fall back to full refresh
+        return fetch_all_usd_rates()
+
+    if latest_date >= today:
+        return 0, before_count, f"✅ Already up to date (latest: {latest_date})\n📊 Total rates in database: {before_count}"
+
+    # Fetch rates from day after latest to today
+    start_date = (datetime.strptime(latest_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    new_count, fetch_msg = fetch_usd_rates_for_date_range(start_date, today)
+
+    # Get updated count
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM cpi_usd_rates")
+        after_count = c.fetchone()[0]
+
+    status_parts = [f"📅 Quick refresh: {start_date} → {today}", fetch_msg, f"📊 Total rates in database: {after_count}"]
+
+    return new_count, after_count, "\n".join(status_parts)
+
+
+def get_usd_rates_as_dataframe(start_date: str | None = None, end_date: str | None = None) -> pd.DataFrame:
+    """
+    Get USD/TRY rates from database as a DataFrame for charting.
+
+    Args:
+        start_date: Optional start date filter (YYYY-MM-DD)
+        end_date: Optional end date filter (YYYY-MM-DD)
+
+    Returns:
+        DataFrame with date and usd_try_rate columns, sorted by date ascending
+    """
+    df = get_cpi_usd_rates()
+    if df.empty:
+        return pd.DataFrame(columns=["date", "usd_try_rate"])
+
+    # Filter by date range if provided
+    if start_date:
+        df = df[df["date"] >= start_date]
+    if end_date:
+        df = df[df["date"] <= end_date]
+
+    # Sort by date ascending for charting
+    df = df.sort_values("date", ascending=True)
+
+    return df[["date", "usd_try_rate"]]

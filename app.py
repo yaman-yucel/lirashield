@@ -8,447 +8,35 @@ Separate data entry for transactions and CPI/USD rates.
 from datetime import datetime
 
 import gradio as gr
-import pandas as pd
 
-from database import (
-    init_db,
-    add_transaction,
-    get_portfolio,
-    delete_transaction,
-    add_cpi_usd_rate,
-    get_cpi_usd_rates,
-    delete_cpi_usd_rate,
-    bulk_import_cpi_usd_rates,
-    add_cpi_official,
-    get_cpi_official_data,
-    delete_cpi_official,
-    bulk_import_cpi_official,
-    get_unique_tickers,
-    get_all_fund_latest_prices,
-    get_fund_price_date_range,
-    get_fund_prices,
+from core.database import init_db, get_unique_tickers, get_cpi_usd_rates, get_cpi_official_data
+from ui.handlers import (
+    # Transaction handlers
+    handle_add_transaction,
+    handle_delete_transaction,
+    refresh_portfolio,
+    handle_refresh_tefas_prices,
+    get_ticker_price_table,
+    # Rate handlers
+    handle_add_rate,
+    handle_delete_rate,
+    handle_fetch_rate,
+    handle_bulk_import,
+    handle_refresh_all_usd_rates,
+    handle_quick_refresh_usd_rates,
+    handle_add_cpi,
+    handle_delete_cpi,
+    handle_bulk_import_cpi,
+    refresh_cpi,
+    # Chart handlers
+    generate_fund_chart,
+    generate_normalized_chart,
+    # Analysis handlers
+    analyze_portfolio,
 )
-from analysis import calculate_real_return, fetch_usd_rate_from_yfinance, get_usd_rate
-from tefas_fetcher import fetch_prices_for_new_ticker, update_fund_prices
 
 # Initialize database on startup
 init_db()
-
-
-# ============== TRANSACTION HANDLERS ==============
-
-
-def handle_add_transaction(date: str, ticker: str, qty: float, tax_rate: float, notes: str):
-    """Handle adding a new transaction. Price is auto-fetched from TEFAS."""
-    if not ticker.strip():
-        return "❌ Ticker is required", get_portfolio()
-    if qty <= 0:
-        return "❌ Quantity must be positive", get_portfolio()
-    if tax_rate < 0 or tax_rate > 100:
-        return "❌ Tax rate must be between 0 and 100", get_portfolio()
-
-    # DateTime with type="string" returns "YYYY-MM-DD HH:MM:SS", extract date part
-    date_str = str(date)[:10] if date else datetime.now().strftime("%Y-%m-%d")
-    ticker_upper = ticker.upper().strip()
-
-    # First, ensure we have TEFAS prices for this ticker
-    existing_range = get_fund_price_date_range(ticker_upper)
-    tefas_status = ""
-
-    if existing_range is None:
-        # New ticker - fetch historical prices first
-        try:
-            inserted, skipped, tefas_msg = fetch_prices_for_new_ticker(ticker_upper, date_str)
-            if inserted > 0:
-                tefas_status = f"📈 TEFAS: {inserted} prices fetched"
-            elif "No data found" in tefas_msg or (inserted == 0 and skipped == 0):
-                return f"❌ {ticker_upper} is not a valid TEFAS fund. Cannot add transaction.", get_portfolio()
-        except Exception as e:
-            return f"❌ Failed to fetch TEFAS prices: {e}", get_portfolio()
-    else:
-        # Update prices to ensure we have the latest
-        update_fund_prices(ticker_upper)
-
-    # add_transaction will look up the price from fund_prices
-    result = add_transaction(date_str, ticker_upper, qty, tax_rate, notes)
-
-    if result.startswith("✅") and tefas_status:
-        result += f"\n{tefas_status}"
-
-    return result, get_portfolio()
-
-
-def handle_delete_transaction(transaction_id: int):
-    """Handle deleting a transaction."""
-    if transaction_id <= 0:
-        return "❌ Enter a valid transaction ID", get_portfolio()
-    result = delete_transaction(int(transaction_id))
-    return result, get_portfolio()
-
-
-def refresh_portfolio():
-    """Refresh the portfolio table."""
-    return get_portfolio()
-
-
-# ============== CPI/USD RATE HANDLERS ==============
-
-
-def handle_add_rate(date: str, rate: float, notes: str):
-    """Handle adding a new CPI/USD rate."""
-    if rate <= 0:
-        return "❌ Rate must be positive", get_cpi_usd_rates()
-
-    date_str = str(date)[:10] if date else datetime.now().strftime("%Y-%m-%d")
-    result = add_cpi_usd_rate(date_str, rate, source="manual", notes=notes)
-    return result, get_cpi_usd_rates()
-
-
-def handle_delete_rate(rate_id: int):
-    """Handle deleting a CPI/USD rate."""
-    if rate_id <= 0:
-        return "❌ Enter a valid rate ID", get_cpi_usd_rates()
-    result = delete_cpi_usd_rate(int(rate_id))
-    return result, get_cpi_usd_rates()
-
-
-def handle_fetch_rate(date: str):
-    """Fetch USD/TRY rate from yfinance and add to database."""
-    date_str = str(date)[:10] if date else datetime.now().strftime("%Y-%m-%d")
-
-    rate = fetch_usd_rate_from_yfinance(date_str)
-    if rate:
-        result = add_cpi_usd_rate(date_str, rate, source="yfinance", notes="Fetched automatically")
-        return result, get_cpi_usd_rates()
-    return f"❌ Could not fetch rate for {date_str}. Try a different date or enter manually.", get_cpi_usd_rates()
-
-
-def handle_bulk_import(csv_text: str):
-    """Handle bulk import of CPI/USD rates."""
-    result = bulk_import_cpi_usd_rates(csv_text)
-    return result, get_cpi_usd_rates()
-
-
-def refresh_rates():
-    """Refresh the rates table."""
-    return get_cpi_usd_rates()
-
-
-# ============== OFFICIAL CPI HANDLERS (TCMB) ==============
-
-
-def handle_add_cpi(year_month: str, cpi_yoy: float, cpi_mom: float, notes: str):
-    """Handle adding official CPI data."""
-    if cpi_yoy <= 0:
-        return "❌ YoY rate must be positive", get_cpi_official_data()
-    result = add_cpi_official(year_month, cpi_yoy, cpi_mom if cpi_mom != 0 else None, notes)
-    return result, get_cpi_official_data()
-
-
-def handle_delete_cpi(cpi_id: int):
-    """Handle deleting a CPI entry."""
-    if cpi_id <= 0:
-        return "❌ Enter a valid CPI ID", get_cpi_official_data()
-    result = delete_cpi_official(int(cpi_id))
-    return result, get_cpi_official_data()
-
-
-def handle_bulk_import_cpi(csv_text: str):
-    """Handle bulk import of CPI data."""
-    result = bulk_import_cpi_official(csv_text)
-    return result, get_cpi_official_data()
-
-
-def refresh_cpi():
-    """Refresh the CPI table."""
-    return get_cpi_official_data()
-
-
-# ============== TEFAS PRICE HANDLERS ==============
-
-
-def handle_refresh_tefas_prices():
-    """Refresh TEFAS prices for all tickers in portfolio."""
-    tickers = get_unique_tickers()
-    if not tickers:
-        return "❌ No tickers in portfolio", pd.DataFrame({"Ticker": ["No tickers"], "Current Price": [0.0]})
-
-    results = []
-    total_inserted = 0
-
-    for ticker in tickers:
-        try:
-            inserted, skipped, msg = update_fund_prices(ticker)
-            total_inserted += inserted
-            if inserted > 0:
-                results.append(f"✅ {ticker}: +{inserted} prices")
-            elif "up to date" in msg.lower():
-                results.append(f"✓ {ticker}: up to date")
-            elif "No data found" in msg:
-                # Only mark as "not a TEFAS fund" if we have zero historical data
-                existing = get_fund_prices(ticker)
-                if existing.empty:
-                    results.append(f"⚠️ {ticker}: not a TEFAS fund")
-                else:
-                    results.append(f"✓ {ticker}: up to date ({len(existing)} prices stored)")
-            else:
-                results.append(f"⚠️ {ticker}: {msg}")
-        except Exception as e:
-            results.append(f"❌ {ticker}: {e}")
-
-    # Get updated price table
-    latest_prices = get_all_fund_latest_prices()
-    prices = []
-    for t in tickers:
-        if t in latest_prices:
-            _, price = latest_prices[t]
-            prices.append(price)
-        else:
-            prices.append(0.0)
-
-    price_table = pd.DataFrame({"Ticker": tickers, "Current Price": prices})
-    status = f"📈 Updated {total_inserted} prices\n" + "\n".join(results)
-
-    return status, price_table
-
-
-# ============== ANALYSIS HANDLERS ==============
-
-
-def analyze_portfolio(price_table_df: pd.DataFrame, auto_fetch: bool):
-    """
-    Analyze portfolio with current prices and calculate real returns.
-
-    Args:
-        price_table_df: DataFrame with Ticker and Current Price columns
-        auto_fetch: Whether to auto-fetch missing USD rates from yfinance
-
-    Returns:
-        Tuple of (details_table, summary_table, status_message)
-    """
-    df = get_portfolio()
-    if df.empty:
-        empty_msg = pd.DataFrame({"Message": ["No transactions found. Add some in the Transactions tab."]})
-        return empty_msg, empty_msg, ""
-
-    # Parse current prices from the table
-    price_map: dict[str, float] = {}
-    if price_table_df is not None and not price_table_df.empty:
-        for _, row in price_table_df.iterrows():
-            ticker = str(row.get("Ticker", "")).strip().upper()
-            price = row.get("Current Price", 0)
-            if ticker and price and float(price) > 0:
-                price_map[ticker] = float(price)
-
-    results = []
-    errors = []
-
-    # Track per-ticker summary data
-    ticker_summary: dict[str, dict] = {}
-
-    for _, row in df.iterrows():
-        ticker = row["ticker"]
-        buy_price = row["price_per_share"]
-        buy_date = row["date"]
-        quantity = row["quantity"]
-        # Handle None/NaN - use pd.isna() for proper NaN detection
-        tax_rate_raw = row.get("tax_rate", 0)
-        tax_rate = 0.0 if pd.isna(tax_rate_raw) else float(tax_rate_raw)
-        invested = buy_price * quantity
-
-        # Get current price (default to buy price if not provided)
-        current_price = price_map.get(ticker.upper(), buy_price)
-        current_value = current_price * quantity
-
-        # Initialize ticker summary if needed
-        if ticker not in ticker_summary:
-            ticker_summary[ticker] = {
-                "total_qty": 0,
-                "total_invested": 0,
-                "total_current": 0,
-                "current_price": current_price,
-                "weighted_real_usd": [],
-                "weighted_real_cpi": [],
-            }
-
-        ticker_summary[ticker]["total_qty"] += quantity
-        ticker_summary[ticker]["total_invested"] += invested
-        ticker_summary[ticker]["total_current"] += current_value
-
-        analysis = calculate_real_return(buy_price, current_price, buy_date, auto_fetch_usd=auto_fetch, tax_rate=tax_rate)
-
-        # Show tax with precision to reveal any rounding issues
-        tax_str = f"{tax_rate:.2f}%" if tax_rate > 0 else "0%"
-
-        if "error" in analysis:
-            errors.append(f"• {ticker} ({buy_date}): {analysis['error']}")
-            results.append(
-                {
-                    "ID": row["id"],
-                    "Date": buy_date,
-                    "Ticker": ticker,
-                    "Qty": quantity,
-                    "Buy": f"{buy_price:.4f}",
-                    "Now": f"{current_price:.4f}",
-                    "Tax": tax_str,
-                    "Nominal": "—",
-                    "USD Δ": "—",
-                    "CPI Δ": "—",
-                    "vs USD": "⚠️ N/A",
-                    "vs CPI": "⚠️ N/A",
-                }
-            )
-        else:
-            nominal = analysis["nominal_pct"]
-            usd_inf = analysis["usd_inflation_pct"]
-            cpi_inf = analysis["cpi_inflation_pct"]
-            real_usd = analysis["real_return_usd_pct"]
-            real_cpi = analysis["real_return_cpi_pct"]
-
-            # Track weighted real returns for summary
-            if real_usd is not None:
-                ticker_summary[ticker]["weighted_real_usd"].append((invested, real_usd))
-            if real_cpi is not None:
-                ticker_summary[ticker]["weighted_real_cpi"].append((invested, real_cpi))
-
-            # Format USD-based real gain
-            if real_usd is not None:
-                usd_str = f"{real_usd:+.2f}%"
-                if real_usd > 0:
-                    usd_str = f"🟢 {usd_str}"
-                elif real_usd < 0:
-                    usd_str = f"🔴 {usd_str}"
-                else:
-                    usd_str = f"⚪ {usd_str}"
-            else:
-                usd_str = "—"
-
-            # Format CPI-based real gain
-            if real_cpi is not None:
-                cpi_str = f"{real_cpi:+.2f}%"
-                if real_cpi > 0:
-                    cpi_str = f"🟢 {cpi_str}"
-                elif real_cpi < 0:
-                    cpi_str = f"🔴 {cpi_str}"
-                else:
-                    cpi_str = f"⚪ {cpi_str}"
-            else:
-                cpi_str = "—"
-
-            results.append(
-                {
-                    "ID": row["id"],
-                    "Date": buy_date,
-                    "Ticker": ticker,
-                    "Qty": quantity,
-                    "Buy": f"{buy_price:.4f}",
-                    "Now": f"{current_price:.4f}",
-                    "Tax": tax_str,
-                    "Nominal": f"{nominal:+.2f}%",
-                    "USD Δ": f"{usd_inf:+.2f}%" if usd_inf is not None else "—",
-                    "CPI Δ": f"{cpi_inf:+.2f}%" if cpi_inf is not None else "—",
-                    "vs USD": usd_str,
-                    "vs CPI": cpi_str,
-                }
-            )
-
-    # Build summary table per ticker
-    # First pass: calculate grand totals for percentage calculation
-    grand_invested = sum(data["total_invested"] for data in ticker_summary.values())
-    grand_current = sum(data["total_current"] for data in ticker_summary.values())
-
-    summary_rows = []
-
-    # Format real returns helper
-    def fmt_real(val):
-        if val is None:
-            return "—"
-        s = f"{val:+.2f}%"
-        if val > 0:
-            return f"🟢 {s}"
-        elif val < 0:
-            return f"🔴 {s}"
-        return f"⚪ {s}"
-
-    for ticker, data in sorted(ticker_summary.items()):
-        invested = data["total_invested"]
-        current = data["total_current"]
-
-        nominal_pct = ((current - invested) / invested * 100) if invested > 0 else 0
-        nominal_gain = current - invested
-
-        # Calculate allocation percentages
-        alloc_invested = (invested / grand_invested * 100) if grand_invested > 0 else 0
-        alloc_current = (current / grand_current * 100) if grand_current > 0 else 0
-
-        # Calculate weighted average real returns
-        avg_real_usd = None
-        if data["weighted_real_usd"]:
-            total_weight = sum(w for w, _ in data["weighted_real_usd"])
-            if total_weight > 0:
-                avg_real_usd = sum(w * r for w, r in data["weighted_real_usd"]) / total_weight
-
-        avg_real_cpi = None
-        if data["weighted_real_cpi"]:
-            total_weight = sum(w for w, _ in data["weighted_real_cpi"])
-            if total_weight > 0:
-                avg_real_cpi = sum(w * r for w, r in data["weighted_real_cpi"]) / total_weight
-
-        summary_rows.append(
-            {
-                "Ticker": ticker,
-                "Shares": f"{data['total_qty']:.2f}",
-                "Avg Cost": f"{invested / data['total_qty']:.4f}" if data["total_qty"] > 0 else "—",
-                "Price": f"{data['current_price']:.4f}",
-                "Invested": f"{invested:,.0f}",
-                "% Inv": f"{alloc_invested:.1f}%",
-                "Value": f"{current:,.0f}",
-                "% Val": f"{alloc_current:.1f}%",
-                "P/L": f"{nominal_gain:+,.0f}",
-                "P/L %": f"{nominal_pct:+.2f}%",
-                "Real (USD)": fmt_real(avg_real_usd),
-                "Real (CPI)": fmt_real(avg_real_cpi),
-            }
-        )
-
-    # Add grand total row
-    if summary_rows:
-        grand_nominal_pct = ((grand_current - grand_invested) / grand_invested * 100) if grand_invested > 0 else 0
-        grand_pl = grand_current - grand_invested
-        summary_rows.append(
-            {
-                "Ticker": "📊 TOTAL",
-                "Shares": "",
-                "Avg Cost": "",
-                "Price": "",
-                "Invested": f"{grand_invested:,.0f}",
-                "% Inv": "100%",
-                "Value": f"{grand_current:,.0f}",
-                "% Val": "100%",
-                "P/L": f"{grand_pl:+,.0f}",
-                "P/L %": f"{grand_nominal_pct:+.2f}%",
-                "Real (USD)": "",
-                "Real (CPI)": "",
-            }
-        )
-
-    # Get today's USD rate for display
-    today = datetime.now().strftime("%Y-%m-%d")
-    today_usd = get_usd_rate(today, auto_fetch=auto_fetch)
-
-    # Build status message
-    status_parts = []
-    if today_usd:
-        status_parts.append(f"📊 Today's USD/TRY: {today_usd:.4f}")
-    if errors:
-        status_parts.append("\n".join(errors))
-    else:
-        status_parts.append("✅ All calculations successful")
-
-    return pd.DataFrame(results), pd.DataFrame(summary_rows), "\n".join(status_parts)
-
-
-# ============== GRADIO UI ==============
 
 
 def create_ui() -> gr.Blocks:
@@ -496,7 +84,7 @@ def create_ui() -> gr.Blocks:
 
             gr.Markdown("### Your Transactions")
             tx_table = gr.Dataframe(
-                value=get_portfolio(),
+                value=refresh_portfolio(),
                 label="Portfolio Transactions (prices from TEFAS)",
                 interactive=False,
             )
@@ -589,32 +177,54 @@ def create_ui() -> gr.Blocks:
                 ### USD/TRY Exchange Rates (Inflation Proxy)
                 
                 The "street method" uses USD/TRY exchange rate changes as an inflation proxy.
-                You can enter rates manually or fetch them automatically from Yahoo Finance.
+                Click the button below to fetch all historical rates needed for your portfolio.
                 """
             )
 
             with gr.Row():
                 with gr.Column(scale=2):
-                    gr.Markdown("#### Add Single Rate")
-                    with gr.Row():
-                        rate_date = gr.DateTime(label="Rate Date", value=datetime.now(), type="string", include_time=False)
-                        rate_value = gr.Number(label="USD/TRY Rate", value=0, minimum=0, precision=4)
-                    rate_notes = gr.Textbox(label="Notes (optional)", max_lines=1)
-
-                    with gr.Row():
-                        btn_add_rate = gr.Button("💾 Save Rate", variant="primary")
-                        btn_fetch_rate = gr.Button("🌐 Fetch from Yahoo Finance", variant="secondary")
-
+                    btn_quick_refresh_usd = gr.Button(
+                        "⚡ Quick Refresh",
+                        variant="primary",
+                        size="lg",
+                    )
+                    gr.Markdown(
+                        "*Fetches only missing rates (from latest stored date to today). Fast!*",
+                    )
+                with gr.Column(scale=2):
+                    btn_refresh_all_usd = gr.Button(
+                        "🔄 Full Refresh",
+                        variant="secondary",
+                        size="lg",
+                    )
+                    gr.Markdown(
+                        "*Fetches all rates from earliest transaction to today. Use if gaps exist.*",
+                    )
                 with gr.Column(scale=1):
                     gr.Markdown("#### Delete Rate")
-                    del_rate_id = gr.Number(label="Rate ID to Delete", value=0, minimum=0)
+                    del_rate_id = gr.Number(label="Rate ID", value=0, minimum=0)
                     btn_del_rate = gr.Button("🗑️ Delete", variant="secondary")
 
-            rate_status = gr.Textbox(label="Status", interactive=False)
+            rate_status = gr.Textbox(label="Status", interactive=False, lines=4)
 
-            gr.Markdown("---")
+            gr.Markdown("### Stored USD/TRY Rates")
+            rate_table = gr.Dataframe(
+                value=get_cpi_usd_rates(),
+                label="USD/TRY Rates (from Yahoo Finance)",
+                interactive=False,
+            )
 
-            with gr.Accordion("📥 Bulk Import Rates (CSV)", open=False):
+            with gr.Accordion("📥 Manual Entry (Advanced)", open=False):
+                gr.Markdown("*Use this only if you need to add rates manually for dates not covered by Yahoo Finance.*")
+                with gr.Row():
+                    rate_date = gr.DateTime(label="Rate Date", value=datetime.now(), type="string", include_time=False)
+                    rate_value = gr.Number(label="USD/TRY Rate", value=0, minimum=0, precision=4)
+                rate_notes = gr.Textbox(label="Notes (optional)", max_lines=1)
+                with gr.Row():
+                    btn_add_rate = gr.Button("💾 Save Rate", variant="secondary")
+                    btn_fetch_rate = gr.Button("🌐 Fetch Single Date", variant="secondary")
+
+            with gr.Accordion("📥 Bulk Import (CSV)", open=False):
                 gr.Markdown(
                     """
                     Paste CSV data in format: `date,rate` (one per line)
@@ -623,27 +233,19 @@ def create_ui() -> gr.Blocks:
                     ```
                     2024-01-01,29.5
                     2024-02-01,30.2
-                    2024-03-01,32.1
                     ```
                     """
                 )
-                bulk_csv = gr.Textbox(label="CSV Data", placeholder="2024-01-01,29.5\n2024-02-01,30.2", lines=5)
-                btn_bulk_import = gr.Button("📥 Import All", variant="primary")
-
-            gr.Markdown("### Stored Rates")
-            rate_table = gr.Dataframe(
-                value=get_cpi_usd_rates(),
-                label="USD/TRY Rates",
-                interactive=False,
-            )
-            btn_refresh_rates = gr.Button("🔄 Refresh Table")
+                bulk_csv = gr.Textbox(label="CSV Data", placeholder="2024-01-01,29.5\n2024-02-01,30.2", lines=3)
+                btn_bulk_import = gr.Button("📥 Import", variant="secondary")
 
             # Rate event handlers
+            btn_quick_refresh_usd.click(handle_quick_refresh_usd_rates, outputs=[rate_status, rate_table])
+            btn_refresh_all_usd.click(handle_refresh_all_usd_rates, outputs=[rate_status, rate_table])
             btn_add_rate.click(handle_add_rate, inputs=[rate_date, rate_value, rate_notes], outputs=[rate_status, rate_table])
             btn_fetch_rate.click(handle_fetch_rate, inputs=[rate_date], outputs=[rate_status, rate_table])
             btn_del_rate.click(handle_delete_rate, inputs=[del_rate_id], outputs=[rate_status, rate_table])
             btn_bulk_import.click(handle_bulk_import, inputs=[bulk_csv], outputs=[rate_status, rate_table])
-            btn_refresh_rates.click(refresh_rates, outputs=[rate_table])
 
         # ============== TAB 4: ANALYSIS ==============
         with gr.Tab("📈 Analyze Returns"):
@@ -658,25 +260,6 @@ def create_ui() -> gr.Blocks:
             )
 
             gr.Markdown("#### Current Prices")
-
-            def get_ticker_price_table():
-                """Generate a table with tickers for price entry, auto-filled from TEFAS data."""
-                tickers = get_unique_tickers()
-                if not tickers:
-                    return pd.DataFrame({"Ticker": ["No tickers"], "Current Price": [0.0]})
-
-                # Get latest prices from database
-                latest_prices = get_all_fund_latest_prices()
-
-                prices = []
-                for t in tickers:
-                    if t in latest_prices:
-                        _, price = latest_prices[t]
-                        prices.append(price)
-                    else:
-                        prices.append(0.0)
-
-                return pd.DataFrame({"Ticker": tickers, "Current Price": prices})
 
             with gr.Row():
                 price_table = gr.Dataframe(
@@ -694,7 +277,7 @@ def create_ui() -> gr.Blocks:
             tefas_status = gr.Textbox(label="TEFAS Update Status", interactive=False, visible=True)
             btn_calc = gr.Button("🧮 Calculate Real Gains", variant="primary", size="lg")
 
-            btn_refresh_tickers.click(lambda: get_ticker_price_table(), outputs=[price_table])
+            btn_refresh_tickers.click(get_ticker_price_table, outputs=[price_table])
             btn_refresh_tefas.click(handle_refresh_tefas_prices, outputs=[tefas_status, price_table])
 
             calc_status = gr.Textbox(label="Calculation Status", interactive=False)
@@ -728,7 +311,90 @@ def create_ui() -> gr.Blocks:
             # Analysis event handlers
             btn_calc.click(analyze_portfolio, inputs=[price_table, auto_fetch_chk], outputs=[out_table, summary_table, calc_status])
 
-        # ============== TAB 5: HELP ==============
+        # ============== TAB 5: FUND CHARTS ==============
+        with gr.Tab("📉 Fund Charts"):
+            gr.Markdown(
+                """
+                ### View Fund Price History
+                
+                View fund prices in both **TRY** and **USD** terms to understand real performance.
+                
+                *USD conversion uses historical USD/TRY rates. Missing rates will be auto-fetched if enabled.*
+                """
+            )
+
+            with gr.Accordion("📈 Single Fund Chart", open=True):
+                gr.Markdown("#### View a single fund's price history in TRY and USD")
+
+                with gr.Row():
+                    chart_ticker = gr.Dropdown(
+                        choices=get_unique_tickers() or ["No tickers"],
+                        label="Select Fund",
+                        value=get_unique_tickers()[0] if get_unique_tickers() else None,
+                        interactive=True,
+                    )
+                    chart_base_date = gr.DateTime(
+                        label="Start Date (optional)",
+                        value=None,
+                        type="string",
+                        include_time=False,
+                        info="Leave empty for full history",
+                    )
+                    chart_auto_fetch = gr.Checkbox(label="Auto-fetch missing USD rates", value=True, info="Fetches from Yahoo Finance")
+                    btn_generate_chart = gr.Button("📈 Generate Chart", variant="primary")
+
+                chart_status = gr.Textbox(label="Status", interactive=False)
+                single_chart = gr.Plot(label="Fund Price Chart")
+
+                btn_generate_chart.click(generate_fund_chart, inputs=[chart_ticker, chart_auto_fetch, chart_base_date], outputs=[single_chart, chart_status])
+
+            with gr.Accordion("📊 Compare Multiple Funds", open=False):
+                gr.Markdown(
+                    """
+                    #### Compare multiple funds on a normalized scale
+                    
+                    All funds are normalized to **100** at the base date for fair comparison.
+                    This shows relative performance regardless of share price.
+                    """
+                )
+
+                with gr.Row():
+                    compare_tickers = gr.Textbox(
+                        label="Tickers (comma-separated)",
+                        placeholder="MAC, TI2, AFT",
+                        value=", ".join(get_unique_tickers()[:3]) if get_unique_tickers() else "",
+                    )
+                    compare_base_date = gr.DateTime(
+                        label="Base Date (optional)",
+                        value=None,
+                        type="string",
+                        include_time=False,
+                        info="Normalization start date",
+                    )
+                with gr.Row():
+                    compare_auto_fetch = gr.Checkbox(label="Auto-fetch missing USD rates", value=True)
+                    compare_show_usd = gr.Checkbox(label="Show in USD", value=True, info="Convert prices to USD for real comparison")
+
+                btn_compare = gr.Button("📊 Compare Funds", variant="primary")
+                compare_status = gr.Textbox(label="Status", interactive=False)
+                compare_chart = gr.Plot(label="Fund Comparison Chart")
+
+                btn_compare.click(generate_normalized_chart, inputs=[compare_tickers, compare_auto_fetch, compare_show_usd, compare_base_date], outputs=[compare_chart, compare_status])
+
+            gr.Markdown(
+                """
+                ---
+                **Understanding the Charts:**
+                
+                - **TRY Price**: Nominal price in Turkish Lira (what you see on TEFAS)
+                - **USD Price**: Price converted to USD using historical exchange rates
+                - **Normalized (100)**: All funds start at 100 for easy comparison
+                
+                *A fund that goes from 100 → 120 gained 20%, while one that goes 100 → 80 lost 20%.*
+                """
+            )
+
+        # ============== TAB 6: HELP ==============
         with gr.Tab("❓ Help"):
             gr.Markdown(
                 """
@@ -741,11 +407,11 @@ def create_ui() -> gr.Blocks:
                 4. Optionally set the **Tax Rate** (% of TRY gains taxed at sell)
                 5. Click "Save Transaction"
                 
-                ### Step 2: Add USD/TRY Rates (for inflation benchmark)
+                ### Step 2: Refresh USD/TRY Rates
                 1. Go to the **💵 USD Rates** tab
-                2. Add the USD/TRY rate for your buy date(s)
-                3. Add today's USD/TRY rate
-                4. You can fetch rates automatically from Yahoo Finance
+                2. Click **"Refresh All USD Rates"** - this fetches all historical rates from Yahoo Finance
+                3. The system automatically determines the date range needed based on your transactions
+                4. All rates are stored in the database for offline use
                 
                 ### Step 3: Analyze
                 1. Go to the **📈 Analyze Returns** tab
@@ -763,6 +429,16 @@ def create_ui() -> gr.Blocks:
                 - Historical data up to 5 years is fetched for new funds
                 
                 **Supported funds:** All funds listed on TEFAS (mutual funds, pension funds, ETFs)
+                
+                ---
+                
+                ## USD/TRY Rate Management
+                
+                All USD/TRY rates are stored in the local database:
+                - Click **"Refresh All USD Rates"** to fetch all rates from your earliest transaction to today
+                - Rates are fetched from Yahoo Finance (USDTRY=X ticker)
+                - Once fetched, rates are stored locally and used for all calculations
+                - Charts and analysis use the database rates (no external calls during analysis)
                 
                 ---
                 
@@ -786,7 +462,7 @@ def create_ui() -> gr.Blocks:
                 
                 - **Fund Prices**: [TEFAS](https://www.tefas.gov.tr/) (automatic)
                 - **CPI**: [TCMB Consumer Prices](https://www.tcmb.gov.tr/wps/wcm/connect/EN/TCMB+EN/Main+Menu/Statistics/Inflation+Data/Consumer+Prices)
-                - **USD/TRY**: Yahoo Finance (TRY=X ticker)
+                - **USD/TRY**: Yahoo Finance (USDTRY=X ticker) - stored in local database
                 
                 The app stores all data in a local SQLite database (`portfolio.db`).
                 """

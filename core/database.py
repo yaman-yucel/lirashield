@@ -4,49 +4,45 @@ Uses SQLite for persistent storage of transactions and inflation benchmark data.
 """
 
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
+from typing import Generator
 
 import pandas as pd
 
 DB_NAME = "portfolio.db"
 
 
-def get_connection() -> sqlite3.Connection:
-    """Get a database connection."""
-    return sqlite3.connect(DB_NAME)
+@contextmanager
+def get_connection() -> Generator[sqlite3.Connection, None, None]:
+    """
+    Get a database connection with automatic commit/rollback and cleanup.
+
+    Usage:
+        with get_connection() as conn:
+            c = conn.cursor()
+            c.execute("SELECT * FROM table")
+    """
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
     """Initialize the database with transactions and CPI/USD rates tables."""
-    conn = get_connection()
-    c = conn.cursor()
+    with get_connection() as conn:
+        c = conn.cursor()
 
-    # Transactions table for portfolio tracking
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            ticker TEXT NOT NULL,
-            quantity REAL NOT NULL,
-            tax_rate REAL NOT NULL DEFAULT 0,
-            notes TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Migrations for existing databases
-    c.execute("PRAGMA table_info(transactions)")
-    columns = [col[1] for col in c.fetchall()]
-
-    # Migration: Add tax_rate column if it doesn't exist
-    if "tax_rate" not in columns:
-        c.execute("ALTER TABLE transactions ADD COLUMN tax_rate REAL NOT NULL DEFAULT 0")
-
-    # Migration: Drop price_per_share column if it exists
-    # SQLite doesn't support DROP COLUMN in older versions, so we recreate the table
-    if "price_per_share" in columns:
+        # Transactions table for portfolio tracking
         c.execute("""
-            CREATE TABLE IF NOT EXISTS transactions_new (
+            CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 date TEXT NOT NULL,
                 ticker TEXT NOT NULL,
@@ -56,56 +52,76 @@ def init_db() -> None:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Migrations for existing databases
+        c.execute("PRAGMA table_info(transactions)")
+        columns = [col[1] for col in c.fetchall()]
+
+        # Migration: Add tax_rate column if it doesn't exist
+        if "tax_rate" not in columns:
+            c.execute("ALTER TABLE transactions ADD COLUMN tax_rate REAL NOT NULL DEFAULT 0")
+
+        # Migration: Drop price_per_share column if it exists
+        # SQLite doesn't support DROP COLUMN in older versions, so we recreate the table
+        if "price_per_share" in columns:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS transactions_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    quantity REAL NOT NULL,
+                    tax_rate REAL NOT NULL DEFAULT 0,
+                    notes TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            c.execute("""
+                INSERT INTO transactions_new (id, date, ticker, quantity, tax_rate, notes, created_at)
+                SELECT id, date, ticker, quantity, COALESCE(tax_rate, 0), notes, created_at
+                FROM transactions
+            """)
+            c.execute("DROP TABLE transactions")
+            c.execute("ALTER TABLE transactions_new RENAME TO transactions")
+
+        # USD/TRY rates table - for USD-based inflation proxy
         c.execute("""
-            INSERT INTO transactions_new (id, date, ticker, quantity, tax_rate, notes, created_at)
-            SELECT id, date, ticker, quantity, COALESCE(tax_rate, 0), notes, created_at
-            FROM transactions
+            CREATE TABLE IF NOT EXISTS cpi_usd_rates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL UNIQUE,
+                usd_try_rate REAL NOT NULL,
+                source TEXT DEFAULT 'manual',
+                notes TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
         """)
-        c.execute("DROP TABLE transactions")
-        c.execute("ALTER TABLE transactions_new RENAME TO transactions")
 
-    # USD/TRY rates table - for USD-based inflation proxy
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS cpi_usd_rates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL UNIQUE,
-            usd_try_rate REAL NOT NULL,
-            source TEXT DEFAULT 'manual',
-            notes TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+        # Official CPI data table - from TCMB (Turkish Central Bank)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS cpi_official (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                year_month TEXT NOT NULL UNIQUE,
+                cpi_yoy REAL NOT NULL,
+                cpi_mom REAL,
+                source TEXT DEFAULT 'TCMB',
+                notes TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    # Official CPI data table - from TCMB (Turkish Central Bank)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS cpi_official (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            year_month TEXT NOT NULL UNIQUE,
-            cpi_yoy REAL NOT NULL,
-            cpi_mom REAL,
-            source TEXT DEFAULT 'TCMB',
-            notes TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Fund prices table for TEFAS data
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS fund_prices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            ticker TEXT NOT NULL,
-            price REAL NOT NULL,
-            source TEXT DEFAULT 'tefas',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(date, ticker)
-        )
-    """)
-    c.execute("CREATE INDEX IF NOT EXISTS idx_fund_prices_ticker ON fund_prices(ticker)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_fund_prices_date ON fund_prices(date)")
-
-    conn.commit()
-    conn.close()
+        # Fund prices table for TEFAS data
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS fund_prices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                price REAL NOT NULL,
+                source TEXT DEFAULT 'tefas',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(date, ticker)
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_fund_prices_ticker ON fund_prices(ticker)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_fund_prices_date ON fund_prices(date)")
 
 
 # ============== TRANSACTION FUNCTIONS ==============
@@ -132,14 +148,12 @@ def add_transaction(date: str, ticker: str, quantity: float, tax_rate: float = 0
         if price is None:
             return f"❌ No price found for {ticker_upper} on or before {valid_date}. Fetch TEFAS prices first."
 
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO transactions (date, ticker, quantity, tax_rate, notes) VALUES (?, ?, ?, ?, ?)",
-            (valid_date, ticker_upper, float(quantity), float(tax_rate), notes),
-        )
-        conn.commit()
-        conn.close()
+        with get_connection() as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO transactions (date, ticker, quantity, tax_rate, notes) VALUES (?, ?, ?, ?, ?)",
+                (valid_date, ticker_upper, float(quantity), float(tax_rate), notes),
+            )
         tax_str = f" (tax: {tax_rate}%)" if tax_rate > 0 else ""
         return f"✅ Transaction added: {ticker_upper} x{quantity} @ {price:.6f} TRY on {valid_date}{tax_str}"
     except ValueError:
@@ -150,61 +164,55 @@ def add_transaction(date: str, ticker: str, quantity: float, tax_rate: float = 0
 
 def get_portfolio() -> pd.DataFrame:
     """Retrieve all transactions as a Pandas DataFrame with buy prices from fund_prices."""
-    conn = get_connection()
-    # Get price from fund_prices using subquery with fallback to closest earlier date
-    # This handles weekends/holidays where exact date may not exist
-    df = pd.read_sql_query(
-        """
-        SELECT 
-            t.id,
-            t.date,
-            t.ticker,
-            t.quantity,
-            (SELECT fp.price FROM fund_prices fp 
-             WHERE fp.ticker = t.ticker AND fp.date <= t.date 
-             ORDER BY fp.date DESC LIMIT 1) as price_per_share,
-            t.tax_rate,
-            t.notes,
-            t.created_at
-        FROM transactions t
-        ORDER BY t.date DESC
-    """,
-        conn,
-    )
-    conn.close()
+    with get_connection() as conn:
+        # Get price from fund_prices using subquery with fallback to closest earlier date
+        # This handles weekends/holidays where exact date may not exist
+        df = pd.read_sql_query(
+            """
+            SELECT 
+                t.id,
+                t.date,
+                t.ticker,
+                t.quantity,
+                (SELECT fp.price FROM fund_prices fp 
+                 WHERE fp.ticker = t.ticker AND fp.date <= t.date 
+                 ORDER BY fp.date DESC LIMIT 1) as price_per_share,
+                t.tax_rate,
+                t.notes,
+                t.created_at
+            FROM transactions t
+            ORDER BY t.date DESC
+        """,
+            conn,
+        )
     return df
 
 
 def get_portfolio_raw() -> pd.DataFrame:
     """Retrieve all transactions without price lookup (raw transaction data)."""
-    conn = get_connection()
-    df = pd.read_sql_query("SELECT * FROM transactions ORDER BY date DESC", conn)
-    conn.close()
+    with get_connection() as conn:
+        df = pd.read_sql_query("SELECT * FROM transactions ORDER BY date DESC", conn)
     return df
 
 
 def get_unique_tickers() -> list[str]:
     """Get list of unique tickers from portfolio, sorted alphabetically."""
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("SELECT DISTINCT ticker FROM transactions ORDER BY ticker")
-    tickers = [row[0] for row in c.fetchall()]
-    conn.close()
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT ticker FROM transactions ORDER BY ticker")
+        tickers = [row[0] for row in c.fetchall()]
     return tickers
 
 
 def delete_transaction(transaction_id: int) -> str:
     """Delete a transaction by ID."""
     try:
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
-        if c.rowcount > 0:
-            conn.commit()
-            conn.close()
-            return f"✅ Transaction #{transaction_id} deleted"
-        conn.close()
-        return f"❌ Transaction #{transaction_id} not found"
+        with get_connection() as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
+            if c.rowcount > 0:
+                return f"✅ Transaction #{transaction_id} deleted"
+            return f"❌ Transaction #{transaction_id} not found"
     except Exception as e:
         return f"❌ Error: {e}"
 
@@ -217,15 +225,13 @@ def add_cpi_usd_rate(date: str, rate: float, source: str = "manual", notes: str 
     try:
         valid_date = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d")
 
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute(
-            """INSERT OR REPLACE INTO cpi_usd_rates (date, usd_try_rate, source, notes) 
-               VALUES (?, ?, ?, ?)""",
-            (valid_date, float(rate), source, notes),
-        )
-        conn.commit()
-        conn.close()
+        with get_connection() as conn:
+            c = conn.cursor()
+            c.execute(
+                """INSERT OR REPLACE INTO cpi_usd_rates (date, usd_try_rate, source, notes) 
+                   VALUES (?, ?, ?, ?)""",
+                (valid_date, float(rate), source, notes),
+            )
         return f"✅ USD/TRY rate for {valid_date}: {rate} ({source})"
     except ValueError:
         return "❌ Error: Date must be in YYYY-MM-DD format"
@@ -235,9 +241,8 @@ def add_cpi_usd_rate(date: str, rate: float, source: str = "manual", notes: str 
 
 def get_cpi_usd_rates() -> pd.DataFrame:
     """Retrieve all CPI/USD rates as a Pandas DataFrame."""
-    conn = get_connection()
-    df = pd.read_sql_query("SELECT * FROM cpi_usd_rates ORDER BY date DESC", conn)
-    conn.close()
+    with get_connection() as conn:
+        df = pd.read_sql_query("SELECT * FROM cpi_usd_rates ORDER BY date DESC", conn)
     return df
 
 
@@ -253,26 +258,23 @@ def get_cpi_usd_rate_for_date(date: str, exact_match: bool = False) -> float | N
     Returns:
         USD/TRY rate or None if not found
     """
-    conn = get_connection()
-    c = conn.cursor()
+    with get_connection() as conn:
+        c = conn.cursor()
 
-    # Try exact match first
-    c.execute("SELECT usd_try_rate FROM cpi_usd_rates WHERE date = ?", (date,))
-    result = c.fetchone()
+        # Try exact match first
+        c.execute("SELECT usd_try_rate FROM cpi_usd_rates WHERE date = ?", (date,))
+        result = c.fetchone()
 
-    if result:
-        conn.close()
-        return result[0]
+        if result:
+            return result[0]
 
-    # If exact_match requested, don't fall back
-    if exact_match:
-        conn.close()
-        return None
+        # If exact_match requested, don't fall back
+        if exact_match:
+            return None
 
-    # If no exact match, find the closest earlier date
-    c.execute("SELECT usd_try_rate FROM cpi_usd_rates WHERE date <= ? ORDER BY date DESC LIMIT 1", (date,))
-    result = c.fetchone()
-    conn.close()
+        # If no exact match, find the closest earlier date
+        c.execute("SELECT usd_try_rate FROM cpi_usd_rates WHERE date <= ? ORDER BY date DESC LIMIT 1", (date,))
+        result = c.fetchone()
 
     return result[0] if result else None
 
@@ -280,15 +282,12 @@ def get_cpi_usd_rate_for_date(date: str, exact_match: bool = False) -> float | N
 def delete_cpi_usd_rate(rate_id: int) -> str:
     """Delete a CPI/USD rate by ID."""
     try:
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute("DELETE FROM cpi_usd_rates WHERE id = ?", (rate_id,))
-        if c.rowcount > 0:
-            conn.commit()
-            conn.close()
-            return f"✅ Rate #{rate_id} deleted"
-        conn.close()
-        return f"❌ Rate #{rate_id} not found"
+        with get_connection() as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM cpi_usd_rates WHERE id = ?", (rate_id,))
+            if c.rowcount > 0:
+                return f"✅ Rate #{rate_id} deleted"
+            return f"❌ Rate #{rate_id} not found"
     except Exception as e:
         return f"❌ Error: {e}"
 
@@ -346,15 +345,13 @@ def add_cpi_official(year_month: str, cpi_yoy: float, cpi_mom: float | None = No
         if len(parts) != 2 or len(parts[0]) != 4 or len(parts[1]) != 2:
             return "❌ Error: Format must be YYYY-MM (e.g., 2024-12)"
 
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute(
-            """INSERT OR REPLACE INTO cpi_official (year_month, cpi_yoy, cpi_mom, source, notes) 
-               VALUES (?, ?, ?, 'TCMB', ?)""",
-            (year_month, float(cpi_yoy), float(cpi_mom) if cpi_mom is not None else None, notes),
-        )
-        conn.commit()
-        conn.close()
+        with get_connection() as conn:
+            c = conn.cursor()
+            c.execute(
+                """INSERT OR REPLACE INTO cpi_official (year_month, cpi_yoy, cpi_mom, source, notes) 
+                   VALUES (?, ?, ?, 'TCMB', ?)""",
+                (year_month, float(cpi_yoy), float(cpi_mom) if cpi_mom is not None else None, notes),
+            )
         return f"✅ CPI for {year_month}: YoY={cpi_yoy}%, MoM={cpi_mom}%"
     except Exception as e:
         return f"❌ Error: {e}"
@@ -362,24 +359,20 @@ def add_cpi_official(year_month: str, cpi_yoy: float, cpi_mom: float | None = No
 
 def get_cpi_official_data() -> pd.DataFrame:
     """Retrieve all official CPI data as a Pandas DataFrame."""
-    conn = get_connection()
-    df = pd.read_sql_query("SELECT * FROM cpi_official ORDER BY year_month DESC", conn)
-    conn.close()
+    with get_connection() as conn:
+        df = pd.read_sql_query("SELECT * FROM cpi_official ORDER BY year_month DESC", conn)
     return df
 
 
 def delete_cpi_official(cpi_id: int) -> str:
     """Delete a CPI entry by ID."""
     try:
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute("DELETE FROM cpi_official WHERE id = ?", (cpi_id,))
-        if c.rowcount > 0:
-            conn.commit()
-            conn.close()
-            return f"✅ CPI entry #{cpi_id} deleted"
-        conn.close()
-        return f"❌ CPI entry #{cpi_id} not found"
+        with get_connection() as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM cpi_official WHERE id = ?", (cpi_id,))
+            if c.rowcount > 0:
+                return f"✅ CPI entry #{cpi_id} deleted"
+            return f"❌ CPI entry #{cpi_id} not found"
     except Exception as e:
         return f"❌ Error: {e}"
 
@@ -438,17 +431,16 @@ def calculate_cumulative_cpi(start_year_month: str, end_year_month: str) -> floa
     Note: This is the simple month-to-month version. For date-accurate calculation,
     use calculate_cumulative_cpi_daily() instead.
     """
-    conn = get_connection()
-    c = conn.cursor()
+    with get_connection() as conn:
+        c = conn.cursor()
 
-    c.execute(
-        """SELECT year_month, cpi_mom FROM cpi_official 
-           WHERE year_month > ? AND year_month <= ? 
-           ORDER BY year_month""",
-        (start_year_month, end_year_month),
-    )
-    rows = c.fetchall()
-    conn.close()
+        c.execute(
+            """SELECT year_month, cpi_mom FROM cpi_official 
+               WHERE year_month > ? AND year_month <= ? 
+               ORDER BY year_month""",
+            (start_year_month, end_year_month),
+        )
+        rows = c.fetchall()
 
     if not rows:
         return None
@@ -530,18 +522,17 @@ def calculate_cumulative_cpi_daily(start_date: str, end_date: str) -> float | No
     cumulative *= start_partial
 
     # === Full months in between ===
-    conn = get_connection()
-    c = conn.cursor()
+    with get_connection() as conn:
+        c = conn.cursor()
 
-    # Get months strictly between start and end
-    c.execute(
-        """SELECT year_month, cpi_mom FROM cpi_official 
-           WHERE year_month > ? AND year_month < ? 
-           ORDER BY year_month""",
-        (start_ym, end_ym),
-    )
-    rows = c.fetchall()
-    conn.close()
+        # Get months strictly between start and end
+        c.execute(
+            """SELECT year_month, cpi_mom FROM cpi_official 
+               WHERE year_month > ? AND year_month < ? 
+               ORDER BY year_month""",
+            (start_ym, end_ym),
+        )
+        rows = c.fetchall()
 
     # Check for missing MoM data in full months
     if any(row[1] is None for row in rows):
@@ -576,21 +567,19 @@ def calculate_cumulative_cpi_daily(start_date: str, end_date: str) -> float | No
 
 def get_cpi_mom_for_month(year_month: str) -> float | None:
     """Get the MoM CPI rate for a specific month. Returns None if not found."""
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("SELECT cpi_mom FROM cpi_official WHERE year_month = ?", (year_month,))
-    result = c.fetchone()
-    conn.close()
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT cpi_mom FROM cpi_official WHERE year_month = ?", (year_month,))
+        result = c.fetchone()
     return result[0] if result and result[0] is not None else None
 
 
 def get_latest_cpi_mom() -> tuple[str, float] | None:
     """Get the most recent CPI MoM rate available. Returns (year_month, mom_rate) or None."""
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("SELECT year_month, cpi_mom FROM cpi_official WHERE cpi_mom IS NOT NULL ORDER BY year_month DESC LIMIT 1")
-    result = c.fetchone()
-    conn.close()
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT year_month, cpi_mom FROM cpi_official WHERE cpi_mom IS NOT NULL ORDER BY year_month DESC LIMIT 1")
+        result = c.fetchone()
     return (result[0], result[1]) if result else None
 
 
@@ -612,16 +601,14 @@ def add_fund_price(date: str, ticker: str, price: float, source: str = "tefas") 
     """
     try:
         valid_date = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d")
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute(
-            """INSERT OR IGNORE INTO fund_prices (date, ticker, price, source) 
-               VALUES (?, ?, ?, ?)""",
-            (valid_date, ticker.upper().strip(), float(price), source),
-        )
-        inserted = c.rowcount > 0
-        conn.commit()
-        conn.close()
+        with get_connection() as conn:
+            c = conn.cursor()
+            c.execute(
+                """INSERT OR IGNORE INTO fund_prices (date, ticker, price, source) 
+                   VALUES (?, ?, ?, ?)""",
+                (valid_date, ticker.upper().strip(), float(price), source),
+            )
+            inserted = c.rowcount > 0
         if inserted:
             return f"✅ Price added: {ticker.upper()} @ {price:.6f} on {valid_date}"
         return f"⏭️ Price already exists: {ticker.upper()} on {valid_date}"
@@ -642,27 +629,25 @@ def bulk_add_fund_prices(prices: list[tuple[str, str, float]], source: str = "te
     Returns:
         Tuple of (inserted_count, skipped_count)
     """
-    conn = get_connection()
-    c = conn.cursor()
-    inserted = 0
-    skipped = 0
+    with get_connection() as conn:
+        c = conn.cursor()
+        inserted = 0
+        skipped = 0
 
-    for date, ticker, price in prices:
-        try:
-            c.execute(
-                """INSERT OR IGNORE INTO fund_prices (date, ticker, price, source) 
-                   VALUES (?, ?, ?, ?)""",
-                (date, ticker.upper().strip(), float(price), source),
-            )
-            if c.rowcount > 0:
-                inserted += 1
-            else:
+        for date, ticker, price in prices:
+            try:
+                c.execute(
+                    """INSERT OR IGNORE INTO fund_prices (date, ticker, price, source) 
+                       VALUES (?, ?, ?, ?)""",
+                    (date, ticker.upper().strip(), float(price), source),
+                )
+                if c.rowcount > 0:
+                    inserted += 1
+                else:
+                    skipped += 1
+            except Exception:
                 skipped += 1
-        except Exception:
-            skipped += 1
 
-    conn.commit()
-    conn.close()
     return inserted, skipped
 
 
@@ -678,20 +663,19 @@ def get_fund_prices(ticker: str, start_date: str | None = None, end_date: str | 
     Returns:
         DataFrame with date, ticker, price columns
     """
-    conn = get_connection()
-    query = "SELECT date, ticker, price FROM fund_prices WHERE ticker = ?"
-    params: list = [ticker.upper().strip()]
+    with get_connection() as conn:
+        query = "SELECT date, ticker, price FROM fund_prices WHERE ticker = ?"
+        params: list = [ticker.upper().strip()]
 
-    if start_date:
-        query += " AND date >= ?"
-        params.append(start_date)
-    if end_date:
-        query += " AND date <= ?"
-        params.append(end_date)
+        if start_date:
+            query += " AND date >= ?"
+            params.append(start_date)
+        if end_date:
+            query += " AND date <= ?"
+            params.append(end_date)
 
-    query += " ORDER BY date DESC"
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
+        query += " ORDER BY date DESC"
+        df = pd.read_sql_query(query, conn, params=params)
     return df
 
 
@@ -702,14 +686,13 @@ def get_latest_fund_price(ticker: str) -> tuple[str, float] | None:
     Returns:
         Tuple of (date, price) or None if not found
     """
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT date, price FROM fund_prices WHERE ticker = ? ORDER BY date DESC LIMIT 1",
-        (ticker.upper().strip(),),
-    )
-    result = c.fetchone()
-    conn.close()
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT date, price FROM fund_prices WHERE ticker = ? ORDER BY date DESC LIMIT 1",
+            (ticker.upper().strip(),),
+        )
+        result = c.fetchone()
     return (result[0], result[1]) if result else None
 
 
@@ -726,44 +709,40 @@ def get_fund_price_for_date(ticker: str, date: str, exact_match: bool = False) -
     Returns:
         Price or None if not found
     """
-    conn = get_connection()
-    c = conn.cursor()
+    with get_connection() as conn:
+        c = conn.cursor()
 
-    # Try exact match first
-    c.execute(
-        "SELECT price FROM fund_prices WHERE ticker = ? AND date = ?",
-        (ticker.upper().strip(), date),
-    )
-    result = c.fetchone()
+        # Try exact match first
+        c.execute(
+            "SELECT price FROM fund_prices WHERE ticker = ? AND date = ?",
+            (ticker.upper().strip(), date),
+        )
+        result = c.fetchone()
 
-    if result:
-        conn.close()
-        return result[0]
+        if result:
+            return result[0]
 
-    if exact_match:
-        conn.close()
-        return None
+        if exact_match:
+            return None
 
-    # Fall back to closest earlier date
-    c.execute(
-        "SELECT price FROM fund_prices WHERE ticker = ? AND date <= ? ORDER BY date DESC LIMIT 1",
-        (ticker.upper().strip(), date),
-    )
-    result = c.fetchone()
-    conn.close()
+        # Fall back to closest earlier date
+        c.execute(
+            "SELECT price FROM fund_prices WHERE ticker = ? AND date <= ? ORDER BY date DESC LIMIT 1",
+            (ticker.upper().strip(), date),
+        )
+        result = c.fetchone()
     return result[0] if result else None
 
 
 def get_oldest_fund_price_date(ticker: str) -> str | None:
     """Get the oldest price date for a fund."""
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT MIN(date) FROM fund_prices WHERE ticker = ?",
-        (ticker.upper().strip(),),
-    )
-    result = c.fetchone()
-    conn.close()
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT MIN(date) FROM fund_prices WHERE ticker = ?",
+            (ticker.upper().strip(),),
+        )
+        result = c.fetchone()
     return result[0] if result and result[0] else None
 
 
@@ -774,14 +753,13 @@ def get_fund_price_date_range(ticker: str) -> tuple[str, str] | None:
     Returns:
         Tuple of (oldest_date, newest_date) or None if no prices
     """
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT MIN(date), MAX(date) FROM fund_prices WHERE ticker = ?",
-        (ticker.upper().strip(),),
-    )
-    result = c.fetchone()
-    conn.close()
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT MIN(date), MAX(date) FROM fund_prices WHERE ticker = ?",
+            (ticker.upper().strip(),),
+        )
+        result = c.fetchone()
     if result and result[0] and result[1]:
         return (result[0], result[1])
     return None
@@ -794,12 +772,11 @@ def get_all_fund_latest_prices() -> dict[str, tuple[str, float]]:
     Returns:
         Dict mapping ticker -> (date, price)
     """
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("""
-        SELECT ticker, date, price FROM fund_prices fp1
-        WHERE date = (SELECT MAX(date) FROM fund_prices fp2 WHERE fp2.ticker = fp1.ticker)
-    """)
-    results = c.fetchall()
-    conn.close()
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT ticker, date, price FROM fund_prices fp1
+            WHERE date = (SELECT MAX(date) FROM fund_prices fp2 WHERE fp2.ticker = fp1.ticker)
+        """)
+        results = c.fetchall()
     return {row[0]: (row[1], row[2]) for row in results}

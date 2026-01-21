@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 from tefas import Crawler
 
-from database import (
+from core.database import (
     bulk_add_fund_prices,
     get_fund_price_date_range,
     get_oldest_fund_price_date,
