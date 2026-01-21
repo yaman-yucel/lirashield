@@ -8,6 +8,7 @@ from ui.handlers.transactions import (
     refresh_portfolio,
     handle_refresh_tefas_prices,
     get_ticker_price_table,
+    get_unique_tickers,
 )
 from ui.handlers.rates import (
     handle_add_rate,
@@ -37,6 +38,7 @@ __all__ = [
     "refresh_portfolio",
     "handle_refresh_tefas_prices",
     "get_ticker_price_table",
+    "get_unique_tickers",
     # Rate handlers
     "handle_add_rate",
     "handle_delete_rate",

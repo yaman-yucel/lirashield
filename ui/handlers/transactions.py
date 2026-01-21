@@ -30,3 +30,8 @@ def handle_refresh_tefas_prices() -> tuple[str, pd.DataFrame]:
 def get_ticker_price_table() -> pd.DataFrame:
     """Generate a table with tickers for price entry, auto-filled from TEFAS data."""
     return PortfolioService.get_ticker_price_table()
+
+
+def get_unique_tickers() -> list[str]:
+    """Get list of unique tickers in portfolio."""
+    return PortfolioService.get_unique_tickers()

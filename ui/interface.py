@@ -8,7 +8,6 @@ from datetime import datetime
 
 import gradio as gr
 
-from core.database import get_unique_tickers, get_cpi_usd_rates, get_cpi_official_data
 from ui.handlers import (
     # Transaction handlers
     handle_add_transaction,
@@ -16,6 +15,7 @@ from ui.handlers import (
     refresh_portfolio,
     handle_refresh_tefas_prices,
     get_ticker_price_table,
+    get_unique_tickers,
     # Rate handlers
     handle_add_rate,
     handle_delete_rate,
@@ -27,6 +27,7 @@ from ui.handlers import (
     handle_delete_cpi,
     handle_bulk_import_cpi,
     refresh_cpi,
+    refresh_rates,
     # Chart handlers
     generate_fund_chart,
     generate_normalized_chart,
@@ -66,7 +67,7 @@ def create_ui() -> gr.Blocks:
                     with gr.Row():
                         tx_qty = gr.Number(label="Quantity", value=1, minimum=0.0001, precision=4)
                         tx_tax = gr.Number(label="Tax Rate at Sell (%)", value=0, minimum=0, maximum=100, precision=2, info="Tax on TRY gains")
-                    tx_notes = gr.Textbox(label="Notes (optional)", placeholder="e.g., Bought on dip", max_lines=1)
+                    tx_notes = gr.Textbox(label="Notes (optional)", placeholder="e.g., Bought on dip/Birthday buy", max_lines=1)
 
                     with gr.Row():
                         btn_add_tx = gr.Button("💾 Save Transaction", variant="primary")
@@ -78,13 +79,14 @@ def create_ui() -> gr.Blocks:
 
             tx_status = gr.Textbox(label="Status", interactive=False)
 
-            gr.Markdown("### Your Transactions")
+            with gr.Row():
+                gr.Markdown("### Your Transactions")
+                btn_refresh_tx = gr.Button("🔄", variant="secondary", size="sm", scale=0, min_width=40)
             tx_table = gr.Dataframe(
                 value=refresh_portfolio(),
                 label="Portfolio Transactions (prices from TEFAS)",
                 interactive=False,
             )
-            btn_refresh_tx = gr.Button("🔄 Refresh Table")
 
             # Transaction event handlers
             btn_add_tx.click(handle_add_transaction, inputs=[tx_date, tx_ticker, tx_qty, tx_tax, tx_notes], outputs=[tx_status, tx_table])
@@ -154,7 +156,7 @@ def create_ui() -> gr.Blocks:
 
             gr.Markdown("### Stored CPI Data")
             cpi_table = gr.Dataframe(
-                value=get_cpi_official_data(),
+                value=refresh_cpi(),
                 label="Official CPI Data (TCMB)",
                 interactive=False,
             )
@@ -205,7 +207,7 @@ def create_ui() -> gr.Blocks:
 
             gr.Markdown("### Stored USD/TRY Rates")
             rate_table = gr.Dataframe(
-                value=get_cpi_usd_rates(),
+                value=refresh_rates(),
                 label="USD/TRY Rates (from Yahoo Finance)",
                 interactive=False,
             )
@@ -448,6 +450,24 @@ def create_ui() -> gr.Blocks:
                 Tax is applied only on **TRY gains** (not losses):
                 - After-tax value = Current Price - (Gain × Tax Rate)
                 - Example: Buy at 0.50, now 0.75, tax 10% → Tax = 0.25 × 10% = 0.025 TRY → After-tax = 0.725 TRY
+                
+                ---
+                
+                ## What is a Benchmark?
+                
+                In finance, a **Benchmark** (Karşılaştırma Ölçütü) is a standard or reference point used to evaluate the performance of a security, mutual fund, or investment manager.
+                
+                **Function:** It serves as a yardstick to determine if an investment is performing better or worse than the general market.
+                
+                **Common Examples:**
+                - **S&P 500** - for US stocks
+                - **BIST 100** - for Turkish stocks
+                - **USD/TRY** - for Turkish inflation (the "street method")
+                - **Official CPI** - for measuring against TCMB inflation data
+                
+                If a fund's benchmark is BIST 100, the fund manager aims to generate returns higher than that index. 
+                
+                **In LiraShield**, we use **USD/TRY** and **Official CPI** as benchmarks to measure your *real* purchasing power gains — because beating nominal inflation is what truly matters.
                 
                 ---
                 
