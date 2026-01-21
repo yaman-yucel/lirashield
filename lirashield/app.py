@@ -1,8 +1,8 @@
 """
-Turkish Real Return Tracker - Gradio UI
+LiraShield - Gradio UI
 
 Track your portfolio returns adjusted for inflation using CPI/USD benchmarks.
-Separate data entry for transactions and CPI/USD rates.
+Protect your purchasing power with real return analytics.
 """
 
 from datetime import datetime
@@ -42,10 +42,10 @@ init_db()
 def create_ui() -> gr.Blocks:
     """Create the Gradio UI."""
 
-    with gr.Blocks(title="Turkish Real Return Tracker") as demo:
+    with gr.Blocks(title="LiraShield") as demo:
         gr.Markdown(
             """
-            # Turkish Real Return Tracker
+            # LiraShield
             
             **Track your portfolio returns adjusted for inflation using USD/TRY as the benchmark.**
             
@@ -471,6 +471,11 @@ def create_ui() -> gr.Blocks:
     return demo
 
 
-if __name__ == "__main__":
+def main():
+    """Entry point for the application."""
     demo = create_ui()
     demo.launch()
+
+
+if __name__ == "__main__":
+    main()

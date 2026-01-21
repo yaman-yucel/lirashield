@@ -1,7 +1,8 @@
 [project]
-name = "delete-portfolio"
+name = "lirashield"
 version = "0.1.0"
-description = "Turkish Real Return Tracker - Track portfolio returns adjusted for inflation using CPI/USD benchmarks"
+description = "LiraShield - Track portfolio returns adjusted for inflation using CPI/USD benchmarks"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "gradio>=5.0.0",
@@ -10,3 +11,15 @@ dependencies = [
     "tefas-crawler>=0.5.0",
     "yfinance>=0.2.0",
 ]
+
+[project.scripts]
+lirashield = "lirashield:main"
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = ["lirashield", "core", "services", "adapters", "ui"]
+module-root = ""
+namespace = true
