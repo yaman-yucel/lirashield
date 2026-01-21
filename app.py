@@ -23,8 +23,9 @@ from database import (
     get_cpi_official_data,
     delete_cpi_official,
     bulk_import_cpi_official,
+    get_unique_tickers,
 )
-from analysis import calculate_real_return, fetch_usd_rate_from_yfinance
+from analysis import calculate_real_return, fetch_usd_rate_from_yfinance, get_usd_rate
 
 # Initialize database on startup
 init_db()
@@ -138,55 +139,62 @@ def refresh_cpi():
 # ============== ANALYSIS HANDLERS ==============
 
 
-def analyze_portfolio(current_prices_str: str, auto_fetch: bool):
+def analyze_portfolio(price_table_df: pd.DataFrame, auto_fetch: bool):
     """
     Analyze portfolio with current prices and calculate real returns.
 
     Args:
-        current_prices_str: Format "TICKER=PRICE, TICKER2=PRICE2"
+        price_table_df: DataFrame with Ticker and Current Price columns
         auto_fetch: Whether to auto-fetch missing USD rates from yfinance
+
+    Returns:
+        Tuple of (details_table, summary_table, status_message)
     """
     df = get_portfolio()
     if df.empty:
-        return pd.DataFrame({"Message": ["No transactions found. Add some in the Transactions tab."]}), ""
+        empty_msg = pd.DataFrame({"Message": ["No transactions found. Add some in the Transactions tab."]})
+        return empty_msg, empty_msg, ""
 
-    # Parse current prices - support both comma and dot as decimal separator
+    # Parse current prices from the table
     price_map: dict[str, float] = {}
-    if current_prices_str.strip():
-        try:
-            # Split by comma, but handle decimal commas by looking for = sign
-            items = []
-            current_item = ""
-            for char in current_prices_str:
-                if char == "," and "=" in current_item and current_item.split("=")[1].strip():
-                    # Check if this looks like a separator (has letters after) or decimal
-                    items.append(current_item.strip())
-                    current_item = ""
-                else:
-                    current_item += char
-            if current_item.strip():
-                items.append(current_item.strip())
-
-            for item in items:
-                if "=" in item:
-                    k, v = item.split("=", 1)
-                    # Replace comma with dot for decimal parsing
-                    v_clean = v.strip().replace(",", ".")
-                    price_map[k.strip().upper()] = float(v_clean)
-        except Exception as e:
-            return pd.DataFrame({"Error": [f"Invalid price format: {e}"]}), ""
+    if price_table_df is not None and not price_table_df.empty:
+        for _, row in price_table_df.iterrows():
+            ticker = str(row.get("Ticker", "")).strip().upper()
+            price = row.get("Current Price", 0)
+            if ticker and price and float(price) > 0:
+                price_map[ticker] = float(price)
 
     results = []
     errors = []
+
+    # Track per-ticker summary data
+    ticker_summary: dict[str, dict] = {}
 
     for _, row in df.iterrows():
         ticker = row["ticker"]
         buy_price = row["price_per_share"]
         buy_date = row["date"]
         quantity = row["quantity"]
+        invested = buy_price * quantity
 
         # Get current price (default to buy price if not provided)
         current_price = price_map.get(ticker.upper(), buy_price)
+        current_value = current_price * quantity
+
+        # Initialize ticker summary if needed
+        if ticker not in ticker_summary:
+            ticker_summary[ticker] = {
+                "total_qty": 0,
+                "total_invested": 0,
+                "total_current": 0,
+                "current_price": current_price,
+                "weighted_real_usd": [],
+                "weighted_real_cpi": [],
+            }
+
+        ticker_summary[ticker]["total_qty"] += quantity
+        ticker_summary[ticker]["total_invested"] += invested
+        ticker_summary[ticker]["total_current"] += current_value
 
         analysis = calculate_real_return(buy_price, current_price, buy_date, auto_fetch_usd=auto_fetch)
 
@@ -198,26 +206,51 @@ def analyze_portfolio(current_prices_str: str, auto_fetch: bool):
                     "Date": buy_date,
                     "Ticker": ticker,
                     "Qty": quantity,
-                    "Buy Price": f"{buy_price:.4f}",
-                    "Cur. Price": f"{current_price:.4f}",
+                    "Buy": f"{buy_price:.4f}",
+                    "Now": f"{current_price:.4f}",
                     "Nominal": "—",
                     "USD Δ": "—",
-                    "REAL GAIN": "⚠️ Missing USD",
+                    "CPI Δ": "—",
+                    "vs USD": "⚠️ N/A",
+                    "vs CPI": "⚠️ N/A",
                 }
             )
         else:
             nominal = analysis["nominal_pct"]
             usd_inf = analysis["usd_inflation_pct"]
-            real_ret = analysis["real_return_pct"]
+            cpi_inf = analysis["cpi_inflation_pct"]
+            real_usd = analysis["real_return_usd_pct"]
+            real_cpi = analysis["real_return_cpi_pct"]
 
-            # Color coding for display
-            real_str = f"{real_ret:+.2f}%"
-            if real_ret > 0:
-                real_str = f"🟢 {real_str}"
-            elif real_ret < 0:
-                real_str = f"🔴 {real_str}"
+            # Track weighted real returns for summary
+            if real_usd is not None:
+                ticker_summary[ticker]["weighted_real_usd"].append((invested, real_usd))
+            if real_cpi is not None:
+                ticker_summary[ticker]["weighted_real_cpi"].append((invested, real_cpi))
+
+            # Format USD-based real gain
+            if real_usd is not None:
+                usd_str = f"{real_usd:+.2f}%"
+                if real_usd > 0:
+                    usd_str = f"🟢 {usd_str}"
+                elif real_usd < 0:
+                    usd_str = f"🔴 {usd_str}"
+                else:
+                    usd_str = f"⚪ {usd_str}"
             else:
-                real_str = f"⚪ {real_str}"
+                usd_str = "—"
+
+            # Format CPI-based real gain
+            if real_cpi is not None:
+                cpi_str = f"{real_cpi:+.2f}%"
+                if real_cpi > 0:
+                    cpi_str = f"🟢 {cpi_str}"
+                elif real_cpi < 0:
+                    cpi_str = f"🔴 {cpi_str}"
+                else:
+                    cpi_str = f"⚪ {cpi_str}"
+            else:
+                cpi_str = "—"
 
             results.append(
                 {
@@ -225,16 +258,110 @@ def analyze_portfolio(current_prices_str: str, auto_fetch: bool):
                     "Date": buy_date,
                     "Ticker": ticker,
                     "Qty": quantity,
-                    "Buy Price": f"{buy_price:.4f}",
-                    "Cur. Price": f"{current_price:.4f}",
+                    "Buy": f"{buy_price:.4f}",
+                    "Now": f"{current_price:.4f}",
                     "Nominal": f"{nominal:+.2f}%",
-                    "USD Δ": f"{usd_inf:+.2f}%",
-                    "REAL GAIN": real_str,
+                    "USD Δ": f"{usd_inf:+.2f}%" if usd_inf is not None else "—",
+                    "CPI Δ": f"{cpi_inf:+.2f}%" if cpi_inf is not None else "—",
+                    "vs USD": usd_str,
+                    "vs CPI": cpi_str,
                 }
             )
 
-    error_msg = "\n".join(errors) if errors else "✅ All calculations successful"
-    return pd.DataFrame(results), error_msg
+    # Build summary table per ticker
+    # First pass: calculate grand totals for percentage calculation
+    grand_invested = sum(data["total_invested"] for data in ticker_summary.values())
+    grand_current = sum(data["total_current"] for data in ticker_summary.values())
+
+    summary_rows = []
+
+    # Format real returns helper
+    def fmt_real(val):
+        if val is None:
+            return "—"
+        s = f"{val:+.2f}%"
+        if val > 0:
+            return f"🟢 {s}"
+        elif val < 0:
+            return f"🔴 {s}"
+        return f"⚪ {s}"
+
+    for ticker, data in sorted(ticker_summary.items()):
+        invested = data["total_invested"]
+        current = data["total_current"]
+
+        nominal_pct = ((current - invested) / invested * 100) if invested > 0 else 0
+        nominal_gain = current - invested
+
+        # Calculate allocation percentages
+        alloc_invested = (invested / grand_invested * 100) if grand_invested > 0 else 0
+        alloc_current = (current / grand_current * 100) if grand_current > 0 else 0
+
+        # Calculate weighted average real returns
+        avg_real_usd = None
+        if data["weighted_real_usd"]:
+            total_weight = sum(w for w, _ in data["weighted_real_usd"])
+            if total_weight > 0:
+                avg_real_usd = sum(w * r for w, r in data["weighted_real_usd"]) / total_weight
+
+        avg_real_cpi = None
+        if data["weighted_real_cpi"]:
+            total_weight = sum(w for w, _ in data["weighted_real_cpi"])
+            if total_weight > 0:
+                avg_real_cpi = sum(w * r for w, r in data["weighted_real_cpi"]) / total_weight
+
+        summary_rows.append(
+            {
+                "Ticker": ticker,
+                "Shares": f"{data['total_qty']:.2f}",
+                "Avg Cost": f"{invested / data['total_qty']:.4f}" if data["total_qty"] > 0 else "—",
+                "Price": f"{data['current_price']:.4f}",
+                "Invested": f"{invested:,.0f}",
+                "% Inv": f"{alloc_invested:.1f}%",
+                "Value": f"{current:,.0f}",
+                "% Val": f"{alloc_current:.1f}%",
+                "P/L": f"{nominal_gain:+,.0f}",
+                "P/L %": f"{nominal_pct:+.2f}%",
+                "Real (USD)": fmt_real(avg_real_usd),
+                "Real (CPI)": fmt_real(avg_real_cpi),
+            }
+        )
+
+    # Add grand total row
+    if summary_rows:
+        grand_nominal_pct = ((grand_current - grand_invested) / grand_invested * 100) if grand_invested > 0 else 0
+        grand_pl = grand_current - grand_invested
+        summary_rows.append(
+            {
+                "Ticker": "📊 TOTAL",
+                "Shares": "",
+                "Avg Cost": "",
+                "Price": "",
+                "Invested": f"{grand_invested:,.0f}",
+                "% Inv": "100%",
+                "Value": f"{grand_current:,.0f}",
+                "% Val": "100%",
+                "P/L": f"{grand_pl:+,.0f}",
+                "P/L %": f"{grand_nominal_pct:+.2f}%",
+                "Real (USD)": "",
+                "Real (CPI)": "",
+            }
+        )
+
+    # Get today's USD rate for display
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_usd = get_usd_rate(today, auto_fetch=auto_fetch)
+
+    # Build status message
+    status_parts = []
+    if today_usd:
+        status_parts.append(f"📊 Today's USD/TRY: {today_usd:.4f}")
+    if errors:
+        status_parts.append("\n".join(errors))
+    else:
+        status_parts.append("✅ All calculations successful")
+
+    return pd.DataFrame(results), pd.DataFrame(summary_rows), "\n".join(status_parts)
 
 
 # ============== GRADIO UI ==============
@@ -246,7 +373,7 @@ def create_ui() -> gr.Blocks:
     with gr.Blocks(title="Turkish Real Return Tracker") as demo:
         gr.Markdown(
             """
-            # 🇹🇷 Turkish Real Return Tracker
+            # Turkish Real Return Tracker
             
             **Track your portfolio returns adjusted for inflation using USD/TRY as the benchmark.**
             
@@ -437,28 +564,46 @@ def create_ui() -> gr.Blocks:
                 
                 Enter current prices for your assets to see inflation-adjusted gains.
                 
-                **Formula:** Real Return = ((1 + Nominal Return) / (1 + USD Change)) - 1
-                
-                **Price format:** `TICKER=PRICE` separated by spaces or commas.
-                Both decimal formats work: `MAC=0.755` or `MAC=0,755`
+                **Formula:** Real Return = ((1 + Nominal Return) / (1 + Inflation)) - 1
                 """
             )
 
+            gr.Markdown("#### Current Prices")
+
+            def get_ticker_price_table():
+                """Generate a table with tickers for price entry."""
+                tickers = get_unique_tickers()
+                if not tickers:
+                    return pd.DataFrame({"Ticker": ["No tickers"], "Current Price": [0.0]})
+                return pd.DataFrame({"Ticker": tickers, "Current Price": [0.0] * len(tickers)})
+
             with gr.Row():
-                curr_price_input = gr.Textbox(
-                    label="Current Prices",
-                    placeholder="e.g., TUPRS=180.5 MAC=0.755 or TUPRS=180,5 MAC=0,755",
-                    max_lines=2,
-                    scale=3,
+                price_table = gr.Dataframe(
+                    value=get_ticker_price_table(),
+                    label="Enter current prices for each ticker",
+                    interactive=True,
+                    column_count=(2, "fixed"),
+                    scale=2,
                 )
-                auto_fetch_chk = gr.Checkbox(label="Auto-fetch missing USD rates", value=False, info="Fetches from Yahoo Finance")
+                with gr.Column(scale=1):
+                    btn_refresh_tickers = gr.Button("🔄 Refresh Tickers", variant="secondary")
+                    auto_fetch_chk = gr.Checkbox(label="Auto-fetch missing USD rates", value=True, info="Fetches from Yahoo Finance")
 
             btn_calc = gr.Button("🧮 Calculate Real Gains", variant="primary", size="lg")
 
+            btn_refresh_tickers.click(lambda: get_ticker_price_table(), outputs=[price_table])
+
             calc_status = gr.Textbox(label="Calculation Status", interactive=False)
 
+            gr.Markdown("#### Portfolio Summary")
+            summary_table = gr.Dataframe(
+                label="Summary by Ticker",
+                interactive=False,
+            )
+
+            gr.Markdown("#### Transaction Details")
             out_table = gr.Dataframe(
-                label="Portfolio Performance",
+                label="Individual Transactions",
                 interactive=False,
             )
 
@@ -466,17 +611,16 @@ def create_ui() -> gr.Blocks:
                 """
                 ---
                 **Legend:**
-                - 🟢 Positive real return (you beat inflation!)
+                - 🟢 Positive real return (beat inflation)
                 - 🔴 Negative real return (inflation won)
-                - ⚪ Zero real return (broke even)
-                - ⚠️ Missing USD rate data
-                
-                **Note:** Add USD rates in the "USD Rates" tab if missing.
+                - **P/L** = Profit/Loss (nominal, in TRY)
+                - **Real (USD)** = Weighted average real return vs USD
+                - **Real (CPI)** = Weighted average real return vs official CPI
                 """
             )
 
             # Analysis event handlers
-            btn_calc.click(analyze_portfolio, inputs=[curr_price_input, auto_fetch_chk], outputs=[out_table, calc_status])
+            btn_calc.click(analyze_portfolio, inputs=[price_table, auto_fetch_chk], outputs=[out_table, summary_table, calc_status])
 
         # ============== TAB 5: HELP ==============
         with gr.Tab("❓ Help"):
@@ -497,10 +641,8 @@ def create_ui() -> gr.Blocks:
                 
                 ### Step 3: Analyze
                 1. Go to the **📈 Analyze Returns** tab
-                2. Enter current prices for your holdings
-                3. Format: `TICKER=PRICE` (e.g., `TUPRS=180.5 MAC=0.755`)
-                4. Both `0.755` and `0,755` work for decimals
-                5. Click "Calculate Real Gains"
+                2. Enter current prices in the table (one row per ticker)
+                3. Click "Calculate Real Gains"
                 
                 ---
                 

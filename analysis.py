@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 import yfinance as yf
 
-from database import get_cpi_usd_rate_for_date, add_cpi_usd_rate
+from database import get_cpi_usd_rate_for_date, add_cpi_usd_rate, calculate_cumulative_cpi_daily
 
 
 def fetch_usd_rate_from_yfinance(date_str: str) -> float | None:
@@ -43,8 +43,9 @@ def get_usd_rate(date_str: str, auto_fetch: bool = False) -> float | None:
     """
     Get USD/TRY rate for a date.
 
-    1. First checks the database for stored rates
-    2. If auto_fetch=True and no data found, attempts yfinance fetch and stores result
+    1. First checks the database for stored rates (exact match if auto_fetch enabled)
+    2. If auto_fetch=True and no exact match, attempts yfinance fetch and stores result
+    3. If auto_fetch=False, falls back to closest earlier date in database
 
     Args:
         date_str: Date in YYYY-MM-DD format
@@ -53,12 +54,13 @@ def get_usd_rate(date_str: str, auto_fetch: bool = False) -> float | None:
     Returns:
         USD/TRY rate or None if unavailable
     """
-    # Try database first
-    db_rate = get_cpi_usd_rate_for_date(date_str)
+    # When auto_fetch is enabled, only accept exact matches from DB
+    # This prevents using stale rates from months ago
+    db_rate = get_cpi_usd_rate_for_date(date_str, exact_match=auto_fetch)
     if db_rate is not None:
         return db_rate
 
-    # Auto-fetch from yfinance if enabled
+    # Auto-fetch from yfinance if enabled and no exact match
     if auto_fetch:
         rate = fetch_usd_rate_from_yfinance(date_str)
         if rate is not None:
@@ -66,16 +68,20 @@ def get_usd_rate(date_str: str, auto_fetch: bool = False) -> float | None:
             add_cpi_usd_rate(date_str, rate, source="yfinance_auto", notes="Auto-fetched")
             return rate
 
+    # If auto_fetch is disabled, try fallback to closest earlier date
+    if not auto_fetch:
+        return get_cpi_usd_rate_for_date(date_str, exact_match=False)
+
     return None
 
 
-def calculate_real_return(buy_price: float, current_price: float, buy_date: str, auto_fetch_usd: bool = False) -> dict[str, float | str]:
+def calculate_real_return(buy_price: float, current_price: float, buy_date: str, auto_fetch_usd: bool = False) -> dict[str, float | str | None]:
     """
-    Calculates Real Return using USD as the inflation proxy.
+    Calculates Real Return using both USD and CPI as inflation benchmarks.
 
-    Formula: ((Current_Price / Buy_Price) / (Current_USD / Buy_USD)) - 1
+    Formula: ((Current_Price / Buy_Price) / (1 + inflation)) - 1
 
-    If the USD rose 20% and your stock rose 20%, your Real Gain is 0%.
+    If inflation is 20% and your stock rose 20%, your Real Gain is 0%.
 
     Args:
         buy_price: Purchase price per share in TRY
@@ -84,36 +90,54 @@ def calculate_real_return(buy_price: float, current_price: float, buy_date: str,
         auto_fetch_usd: Whether to auto-fetch USD rates from yfinance
 
     Returns:
-        Dictionary with nominal_pct, usd_inflation_pct, real_return_pct
-        or error message if USD data is missing
+        Dictionary with nominal_pct, usd_inflation_pct, cpi_inflation_pct,
+        real_return_usd_pct, real_return_cpi_pct
+        or error message if data is missing
     """
-    # Get buy date USD rate
-    buy_usd = get_usd_rate(buy_date, auto_fetch=auto_fetch_usd)
-
-    # Get current USD rate (today)
     current_date = datetime.now().strftime("%Y-%m-%d")
+
+    # Calculate nominal return
+    nominal_return = (current_price - buy_price) / buy_price
+
+    result: dict[str, float | str | None] = {
+        "nominal_pct": round(nominal_return * 100, 2),
+        "usd_inflation_pct": None,
+        "real_return_usd_pct": None,
+        "cpi_inflation_pct": None,
+        "real_return_cpi_pct": None,
+        "buy_usd": None,
+        "current_usd": None,
+    }
+
+    # === USD-based calculation ===
+    buy_usd = get_usd_rate(buy_date, auto_fetch=auto_fetch_usd)
     current_usd = get_usd_rate(current_date, auto_fetch=auto_fetch_usd)
 
-    # Return error if USD data is missing
-    if buy_usd is None:
-        return {"error": f"Missing USD rate for {buy_date}. Add it in CPI/USD tab."}
-    if current_usd is None:
-        return {"error": f"Missing USD rate for today ({current_date}). Add it in CPI/USD tab."}
+    if buy_usd is not None and current_usd is not None:
+        usd_change = (current_usd - buy_usd) / buy_usd
+        real_return_usd = ((1 + nominal_return) / (1 + usd_change)) - 1
 
-    # Calculate returns
-    nominal_return = (current_price - buy_price) / buy_price
-    usd_change = (current_usd - buy_usd) / buy_usd
+        result["usd_inflation_pct"] = round(usd_change * 100, 2)
+        result["real_return_usd_pct"] = round(real_return_usd * 100, 2)
+        result["buy_usd"] = round(buy_usd, 4)
+        result["current_usd"] = round(current_usd, 4)
 
-    # Real Return Formula: ((1 + nominal) / (1 + inflation)) - 1
-    real_return = ((1 + nominal_return) / (1 + usd_change)) - 1
+    # === CPI-based calculation ===
+    # Use daily-compounded CPI for accurate partial month calculation
+    cpi_change = calculate_cumulative_cpi_daily(buy_date, current_date)
 
-    return {
-        "nominal_pct": round(nominal_return * 100, 2),
-        "usd_inflation_pct": round(usd_change * 100, 2),
-        "real_return_pct": round(real_return * 100, 2),
-        "buy_usd": round(buy_usd, 4),
-        "current_usd": round(current_usd, 4),
-    }
+    if cpi_change is not None:
+        cpi_decimal = cpi_change / 100  # Convert percentage to decimal
+        real_return_cpi = ((1 + nominal_return) / (1 + cpi_decimal)) - 1
+
+        result["cpi_inflation_pct"] = round(cpi_change, 2)
+        result["real_return_cpi_pct"] = round(real_return_cpi * 100, 2)
+
+    # Check if we have at least one benchmark
+    if result["real_return_usd_pct"] is None and result["real_return_cpi_pct"] is None:
+        return {"error": f"Missing both USD and CPI data for {buy_date}. Add rates in USD/CPI tabs."}
+
+    return result
 
 
 def calculate_portfolio_summary(positions: list[dict], auto_fetch_usd: bool = False) -> dict[str, float]:
@@ -125,11 +149,12 @@ def calculate_portfolio_summary(positions: list[dict], auto_fetch_usd: bool = Fa
         auto_fetch_usd: Whether to auto-fetch USD rates
 
     Returns:
-        Summary with total_invested, current_value, nominal_gain, real_gain
+        Summary with total_invested, current_value, nominal_gain, real_gain (USD & CPI)
     """
     total_invested = 0.0
     current_value = 0.0
-    weighted_real_gains = []
+    weighted_real_gains_usd: list[tuple[float, float]] = []
+    weighted_real_gains_cpi: list[tuple[float, float]] = []
 
     for pos in positions:
         qty = pos.get("quantity", 1)
@@ -143,15 +168,21 @@ def calculate_portfolio_summary(positions: list[dict], auto_fetch_usd: bool = Fa
         current_value += current
 
         result = calculate_real_return(buy_price, current_price, pos["buy_date"], auto_fetch_usd)
-        if "real_return_pct" in result:
-            weighted_real_gains.append((invested, result["real_return_pct"]))
+        if result.get("real_return_usd_pct") is not None:
+            weighted_real_gains_usd.append((invested, result["real_return_usd_pct"]))
+        if result.get("real_return_cpi_pct") is not None:
+            weighted_real_gains_cpi.append((invested, result["real_return_cpi_pct"]))
 
-    # Calculate weighted average real gain
-    if weighted_real_gains and total_invested > 0:
-        weighted_sum = sum(inv * gain for inv, gain in weighted_real_gains)
-        avg_real_gain = weighted_sum / total_invested
-    else:
-        avg_real_gain = 0.0
+    # Calculate weighted average real gains
+    avg_real_gain_usd = 0.0
+    if weighted_real_gains_usd and total_invested > 0:
+        weighted_sum = sum(inv * gain for inv, gain in weighted_real_gains_usd)
+        avg_real_gain_usd = weighted_sum / total_invested
+
+    avg_real_gain_cpi = 0.0
+    if weighted_real_gains_cpi and total_invested > 0:
+        weighted_sum = sum(inv * gain for inv, gain in weighted_real_gains_cpi)
+        avg_real_gain_cpi = weighted_sum / total_invested
 
     nominal_gain_pct = ((current_value - total_invested) / total_invested * 100) if total_invested > 0 else 0
 
@@ -159,5 +190,6 @@ def calculate_portfolio_summary(positions: list[dict], auto_fetch_usd: bool = Fa
         "total_invested": round(total_invested, 2),
         "current_value": round(current_value, 2),
         "nominal_gain_pct": round(nominal_gain_pct, 2),
-        "avg_real_gain_pct": round(avg_real_gain, 2),
+        "avg_real_gain_usd_pct": round(avg_real_gain_usd, 2),
+        "avg_real_gain_cpi_pct": round(avg_real_gain_cpi, 2),
     }

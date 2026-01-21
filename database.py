@@ -94,6 +94,16 @@ def get_portfolio() -> pd.DataFrame:
     return df
 
 
+def get_unique_tickers() -> list[str]:
+    """Get list of unique tickers from portfolio, sorted alphabetically."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT ticker FROM transactions ORDER BY ticker")
+    tickers = [row[0] for row in c.fetchall()]
+    conn.close()
+    return tickers
+
+
 def delete_transaction(transaction_id: int) -> str:
     """Delete a transaction by ID."""
     try:
@@ -142,8 +152,18 @@ def get_cpi_usd_rates() -> pd.DataFrame:
     return df
 
 
-def get_cpi_usd_rate_for_date(date: str) -> float | None:
-    """Get the USD/TRY rate for a specific date. Returns None if not found."""
+def get_cpi_usd_rate_for_date(date: str, exact_match: bool = False) -> float | None:
+    """
+    Get the USD/TRY rate for a specific date.
+
+    Args:
+        date: Date in YYYY-MM-DD format
+        exact_match: If True, only return rate if exact date exists.
+                     If False, fall back to closest earlier date.
+
+    Returns:
+        USD/TRY rate or None if not found
+    """
     conn = get_connection()
     c = conn.cursor()
 
@@ -154,6 +174,11 @@ def get_cpi_usd_rate_for_date(date: str) -> float | None:
     if result:
         conn.close()
         return result[0]
+
+    # If exact_match requested, don't fall back
+    if exact_match:
+        conn.close()
+        return None
 
     # If no exact match, find the closest earlier date
     c.execute("SELECT usd_try_rate FROM cpi_usd_rates WHERE date <= ? ORDER BY date DESC LIMIT 1", (date,))
@@ -320,6 +345,9 @@ def calculate_cumulative_cpi(start_year_month: str, end_year_month: str) -> floa
     """
     Calculate cumulative inflation between two months using MoM rates.
     Returns the total percentage change (e.g., 25.5 for 25.5% inflation).
+
+    Note: This is the simple month-to-month version. For date-accurate calculation,
+    use calculate_cumulative_cpi_daily() instead.
     """
     conn = get_connection()
     c = conn.cursor()
@@ -345,3 +373,118 @@ def calculate_cumulative_cpi(start_year_month: str, end_year_month: str) -> floa
         cumulative *= 1 + (mom / 100)
 
     return (cumulative - 1) * 100
+
+
+def get_days_in_month(year: int, month: int) -> int:
+    """Return the number of days in a given month."""
+    import calendar
+
+    return calendar.monthrange(year, month)[1]
+
+
+def calculate_cumulative_cpi_daily(start_date: str, end_date: str) -> float | None:
+    """
+    Calculate cumulative inflation between two dates using daily-compounded CPI.
+
+    Uses monthly CPI data but interpolates daily using compounding:
+    - daily_rate = (1 + monthly_rate)^(1/days_in_month) - 1
+
+    For partial months:
+    - Start month: Calculate from buy_day to end of month
+    - End month: Calculate from start of month to today
+    - Full months in between: Use full monthly rate
+
+    Args:
+        start_date: Purchase date in YYYY-MM-DD format
+        end_date: Current date in YYYY-MM-DD format
+
+    Returns:
+        Cumulative inflation as percentage (e.g., 25.5 for 25.5%), or None if data missing
+    """
+    from datetime import datetime
+
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+    start_year, start_month, start_day = start_dt.year, start_dt.month, start_dt.day
+    end_year, end_month, end_day = end_dt.year, end_dt.month, end_dt.day
+
+    start_ym = f"{start_year:04d}-{start_month:02d}"
+    end_ym = f"{end_year:04d}-{end_month:02d}"
+
+    # If same month, calculate partial month only
+    # Days held = transitions from start_day to end_day = end_day - start_day
+    if start_ym == end_ym:
+        days_held = end_day - start_day
+        if days_held <= 0:
+            return 0.0
+        mom = get_cpi_mom_for_month(start_ym)
+        if mom is None:
+            return None
+        days_in_month = get_days_in_month(start_year, start_month)
+        # Daily compounding: partial = (1 + mom)^(days_held/days_in_month) - 1
+        partial = (1 + mom / 100) ** (days_held / days_in_month) - 1
+        return partial * 100
+
+    cumulative = 1.0
+
+    # === Start month (partial): from buy_day to end of month ===
+    start_mom = get_cpi_mom_for_month(start_ym)
+    if start_mom is None:
+        return None
+
+    days_in_start_month = get_days_in_month(start_year, start_month)
+    days_remaining_start = days_in_start_month - start_day + 1  # Include buy day
+
+    # Daily compounding for partial start month
+    start_partial = (1 + start_mom / 100) ** (days_remaining_start / days_in_start_month)
+    cumulative *= start_partial
+
+    # === Full months in between ===
+    conn = get_connection()
+    c = conn.cursor()
+
+    # Get months strictly between start and end
+    c.execute(
+        """SELECT year_month, cpi_mom FROM cpi_official 
+           WHERE year_month > ? AND year_month < ? 
+           ORDER BY year_month""",
+        (start_ym, end_ym),
+    )
+    rows = c.fetchall()
+    conn.close()
+
+    # Check for missing MoM data in full months
+    if any(row[1] is None for row in rows):
+        return None
+
+    for _, mom in rows:
+        cumulative *= 1 + (mom / 100)
+
+    # === End month (partial): from start of month to today ===
+    # On day 1, you've experienced 0 days of that month's inflation
+    # On day 21, you've experienced 20 days (day 1→2, 2→3, ..., 20→21)
+    days_elapsed_end = end_day - 1
+
+    if days_elapsed_end > 0:
+        end_mom = get_cpi_mom_for_month(end_ym)
+        if end_mom is not None:
+            days_in_end_month = get_days_in_month(end_year, end_month)
+
+            # Daily compounding for partial end month
+            end_partial = (1 + end_mom / 100) ** (days_elapsed_end / days_in_end_month)
+            cumulative *= end_partial
+        # If end month CPI not available (current month), skip it
+        # This slightly underestimates inflation but allows calculation to proceed
+
+    return (cumulative - 1) * 100
+
+
+def get_cpi_mom_for_month(year_month: str) -> float | None:
+    """Get the MoM CPI rate for a specific month. Returns None if not found."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT cpi_mom FROM cpi_official WHERE year_month = ?", (year_month,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result and result[0] is not None else None
