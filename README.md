@@ -196,8 +196,8 @@ See `pyproject.toml` for complete dependency list.
 
 ## License
 
-[Add license information here]
+Do whatever you want
 
 ## Contributing
 
-[Add contributing guidelines here]
+No contribution, private project.
