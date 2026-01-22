@@ -10,4 +10,6 @@ wheels/
 .venv
 
 # Database
-portfolio.db
+data/
+
+.env

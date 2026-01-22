@@ -6,6 +6,8 @@ from datetime import datetime
 
 import pandas as pd
 
+from core.log import get_logger
+
 from core.database import (
     ASSET_TEFAS,
     ASSET_USD_STOCK,
@@ -26,6 +28,8 @@ from core.database import (
 )
 from adapters.tefas import fetch_prices_for_new_ticker, update_fund_prices
 from adapters.yfinance_stocks import fetch_prices_for_new_stock, update_stock_prices
+
+logger = get_logger("portfolio")
 
 
 class PortfolioService:
@@ -58,13 +62,18 @@ class PortfolioService:
         Returns:
             Tuple of (status message, updated portfolio DataFrame)
         """
+        logger.info(f"PortfolioService.add_transaction called: {ticker}, qty={quantity}, type={transaction_type}")
         if not ticker.strip():
+            logger.warning("Ticker validation failed: empty ticker")
             return "❌ Ticker is required", get_portfolio()
         if quantity <= 0:
+            logger.warning(f"Quantity validation failed: {quantity} <= 0")
             return "❌ Quantity must be positive", get_portfolio()
         if tax_rate < 0 or tax_rate > 100:
+            logger.warning(f"Tax rate validation failed: {tax_rate} not in [0, 100]")
             return "❌ Tax rate must be between 0 and 100", get_portfolio()
         if price_per_share is not None and price_per_share <= 0:
+            logger.warning(f"Price validation failed: {price_per_share} <= 0")
             return "❌ Buy price must be positive", get_portfolio()
 
         # Extract date part
@@ -77,19 +86,17 @@ class PortfolioService:
             # For cash, ticker IS the currency (TRY or USD)
             currency = ticker_upper if ticker_upper in [CURRENCY_TRY, CURRENCY_USD] else CURRENCY_TRY
             ticker_upper = f"CASH_{currency}"
-            result = add_transaction(date_str, ticker_upper, quantity, tax_rate, notes, asset_type, currency, tx_type, price_per_share)
-            return result, get_portfolio()
-
         elif asset_type == ASSET_USD_STOCK:
             currency = CURRENCY_USD
-            result = add_transaction(date_str, ticker_upper, quantity, tax_rate, notes, asset_type, currency, tx_type, price_per_share)
-            return result, get_portfolio()
-
         else:
             # TEFAS fund (default)
             currency = CURRENCY_TRY
-            result = add_transaction(date_str, ticker_upper, quantity, tax_rate, notes, asset_type, currency, tx_type, price_per_share)
-            return result, get_portfolio()
+        result = add_transaction(date_str, ticker_upper, quantity, tax_rate, notes, asset_type, currency, tx_type, price_per_share)
+        if result.startswith("✅"):
+            logger.info(f"Transaction added successfully: {result}")
+        else:
+            logger.error(f"Transaction failed: {result}")
+        return result, get_portfolio()
 
     @staticmethod
     def delete_transaction(transaction_id: int) -> tuple[str, pd.DataFrame]:
@@ -102,15 +109,28 @@ class PortfolioService:
         Returns:
             Tuple of (status message, updated portfolio DataFrame)
         """
+        logger.info(f"PortfolioService.delete_transaction called: ID={transaction_id}")
         if transaction_id <= 0:
+            logger.warning(f"Invalid transaction ID: {transaction_id}")
             return "❌ Enter a valid transaction ID", get_portfolio()
         result = delete_transaction(int(transaction_id))
+        if result.startswith("✅"):
+            logger.info(f"Transaction deleted successfully: {result}")
+        else:
+            logger.error(f"Transaction deletion failed: {result}")
         return result, get_portfolio()
 
     @staticmethod
-    def get_portfolio() -> pd.DataFrame:
-        """Get all transactions with buy prices."""
-        return get_portfolio()
+    def get_portfolio(ticker: str | None = None) -> pd.DataFrame:
+        """Get all transactions with buy prices.
+
+        Args:
+            ticker: Optional ticker symbol to filter by. If None, returns all transactions.
+
+        Returns:
+            DataFrame with portfolio transactions, optionally filtered by ticker.
+        """
+        return get_portfolio(ticker)
 
     @staticmethod
     def get_unique_tickers() -> list[str]:
@@ -161,8 +181,10 @@ class PortfolioService:
         Returns:
             Tuple of (status message, price table DataFrame)
         """
+        logger.info("Starting price refresh for all tickers")
         tickers_info = get_tickers_with_info()
         if not tickers_info:
+            logger.warning("No tickers found in portfolio")
             return "❌ No tickers in portfolio", pd.DataFrame({"Ticker": ["No tickers"], "Current Price": [0.0], "Currency": [""]})
 
         results = []
@@ -178,6 +200,7 @@ class PortfolioService:
                 continue
 
             try:
+                logger.info(f"Refreshing prices for {ticker} ({asset_type})")
                 if asset_type == ASSET_USD_STOCK:
                     inserted, skipped, msg = update_stock_prices(ticker)
                     source = "yfinance"
@@ -187,33 +210,29 @@ class PortfolioService:
 
                 total_inserted += inserted
                 if inserted > 0:
+                    logger.info(f"{ticker}: Inserted {inserted} prices from {source}")
                     results.append(f"✅ {ticker}: +{inserted} prices ({source})")
                 elif "up to date" in msg.lower():
+                    logger.info(f"{ticker}: Prices up to date")
                     results.append(f"✓ {ticker}: up to date")
                 elif "No data found" in msg:
                     existing = get_fund_prices(ticker)
                     if existing.empty:
+                        logger.warning(f"{ticker}: No price data found")
                         results.append(f"⚠️ {ticker}: no price data found")
                     else:
+                        logger.info(f"{ticker}: Using existing {len(existing)} prices")
                         results.append(f"✓ {ticker}: up to date ({len(existing)} prices stored)")
                 else:
+                    logger.warning(f"{ticker}: {msg}")
                     results.append(f"⚠️ {ticker}: {msg}")
             except Exception as e:
+                logger.error(f"Error refreshing prices for {ticker}: {e}", exc_info=True)
                 results.append(f"❌ {ticker}: {e}")
 
         # Get updated price table
         price_table = PortfolioService.get_ticker_price_table()
         status = f"📈 Updated {total_inserted} prices\n" + "\n".join(results)
+        logger.info(f"Price refresh completed: {total_inserted} total prices inserted")
 
         return status, price_table
-
-    @staticmethod
-    def refresh_tefas_prices() -> tuple[str, pd.DataFrame]:
-        """
-        Refresh TEFAS prices for all tickers in portfolio.
-        Deprecated: Use refresh_prices() instead.
-
-        Returns:
-            Tuple of (status message, price table DataFrame)
-        """
-        return PortfolioService.refresh_prices()

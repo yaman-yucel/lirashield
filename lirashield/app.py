@@ -8,11 +8,13 @@ Protect your purchasing power with real return analytics.
 from core.database import init_db
 from ui import create_ui
 
-init_db()
+from core.config import init_settings
 
 
 def main():
     """Entry point for the application."""
+    init_settings()
+    init_db()
     demo = create_ui()
     demo.launch()
 

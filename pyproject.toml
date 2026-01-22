@@ -8,6 +8,7 @@ dependencies = [
     "gradio>=5.0.0",
     "pandas>=2.0.0",
     "plotly>=6.5.2",
+    "pydantic-settings>=2.12.0",
     "tefas-crawler>=0.5.0",
     "yfinance>=0.2.0",
 ]
@@ -23,3 +24,9 @@ build-backend = "uv_build"
 module-name = ["lirashield", "core", "services", "adapters", "ui"]
 module-root = ""
 namespace = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-mock>=3.15.1",
+]

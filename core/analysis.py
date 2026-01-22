@@ -82,6 +82,7 @@ def calculate_real_return(
     buy_date: str,
     auto_fetch_usd: bool = False,
     tax_rate: float = 0,
+    skip_usd_cpi: bool = False,
 ) -> dict[str, float | str | None]:
     """
     Calculates Real Return using both USD and CPI as inflation benchmarks.
@@ -99,6 +100,7 @@ def calculate_real_return(
         buy_date: Purchase date in YYYY-MM-DD format
         auto_fetch_usd: Whether to auto-fetch USD rates from yfinance
         tax_rate: Tax rate on TRY gains (0-100, e.g., 10 for 10%)
+        skip_usd_cpi: If True, skip USD and CPI calculations (for USD-based assets and cash)
 
     Returns:
         Dictionary with nominal_pct, usd_inflation_pct, cpi_inflation_pct,
@@ -126,6 +128,10 @@ def calculate_real_return(
         "tax_rate": tax_rate,
         "tax_amount_per_share": round(tax_amount, 4) if tax_rate > 0 else None,
     }
+
+    # Skip USD and CPI calculations for USD-based assets and cash
+    if skip_usd_cpi:
+        return result
 
     # === USD-based calculation ===
     buy_usd = get_usd_rate(buy_date, auto_fetch=auto_fetch_usd)

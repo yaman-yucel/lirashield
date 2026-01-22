@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 
 from tefas import Crawler
 
+from core.log import get_logger
+
 from core.database import (
     CURRENCY_TRY,
     bulk_add_fund_prices,
@@ -19,6 +21,8 @@ from core.database import (
 
 
 CHUNK_DAYS = 60  # TEFAS API has ~90 day limit, use 60 for safety
+
+logger = get_logger("tefas")
 
 
 def fetch_fund_prices(
@@ -43,6 +47,7 @@ def fetch_fund_prices(
         Tuple of (inserted_count, skipped_count, status_message)
     """
     ticker = ticker.upper().strip()
+    logger.info(f"Fetching TEFAS prices for {ticker} from {start_date} to {end_date}")
 
     # Default end_date to today
     if end_date is None:
@@ -63,6 +68,7 @@ def fetch_fund_prices(
         total_inserted = 0
         total_skipped = 0
         all_prices = []
+        failed_chunks = 0
 
         # Fetch in chunks to avoid API limits
         current_start = start_dt
@@ -73,26 +79,37 @@ def fetch_fund_prices(
             chunk_end = current_end.strftime("%Y-%m-%d")
 
             try:
+                logger.debug(f"Fetching chunk {chunk_start} to {chunk_end} for {ticker}")
                 data = crawler.fetch(start=chunk_start, end=chunk_end, name=ticker)
 
                 if not data.empty:
+                    chunk_prices = len(data)
                     for _, row in data.iterrows():
                         date_str = row["date"].strftime("%Y-%m-%d") if hasattr(row["date"], "strftime") else str(row["date"])
                         all_prices.append((date_str, ticker, float(row["price"])))
-            except Exception:
-                pass  # Skip failed chunks, continue with others
+                    logger.debug(f"Fetched {chunk_prices} prices for chunk {chunk_start} to {chunk_end}")
+            except Exception as e:
+                failed_chunks += 1
+                logger.warning(f"Failed to fetch chunk {chunk_start} to {chunk_end} for {ticker}: {e}")
 
             current_start = current_end + timedelta(days=1)
 
+        if failed_chunks > 0:
+            logger.warning(f"{failed_chunks} chunks failed for {ticker}, continuing with successful chunks")
+
         if not all_prices:
+            logger.warning(f"No data found for {ticker} between {start_date} and {end_date}")
             return 0, 0, f"⚠️ No data found for {ticker} between {start_date} and {end_date}"
 
+        logger.info(f"Collected {len(all_prices)} prices for {ticker}, bulk inserting...")
         # Bulk insert all collected prices (TEFAS funds are in TRY)
         inserted, skipped = bulk_add_fund_prices(all_prices, source="tefas", currency=CURRENCY_TRY)
+        logger.info(f"TEFAS fetch completed for {ticker}: {inserted} inserted, {skipped} skipped")
 
         return inserted, skipped, f"✅ {ticker}: {inserted} new prices added, {skipped} already existed"
 
     except Exception as e:
+        logger.error(f"Error fetching TEFAS prices for {ticker}: {e}", exc_info=True)
         return 0, 0, f"❌ Error fetching {ticker}: {e}"
 
 
@@ -109,10 +126,12 @@ def update_fund_prices(ticker: str) -> tuple[int, int, str]:
     """
     ticker = ticker.upper().strip()
     today = datetime.now().strftime("%Y-%m-%d")
+    logger.info(f"Updating TEFAS prices for {ticker}")
 
     latest = get_latest_fund_price(ticker)
 
     if latest is None:
+        logger.info(f"No existing data for {ticker}, fetching full history")
         # No data exists, fetch full history
         return fetch_fund_prices(ticker, end_date=today)
 
@@ -121,17 +140,20 @@ def update_fund_prices(ticker: str) -> tuple[int, int, str]:
     # Check if we're already up to date (within last 3 days to account for weekends/holidays)
     days_since_latest = (datetime.now() - datetime.strptime(latest_date, "%Y-%m-%d")).days
     if days_since_latest <= 3:
+        logger.info(f"{ticker} is up to date (latest: {latest_date}, {days_since_latest} days ago)")
         return 0, 0, f"✅ {ticker} is up to date (latest: {latest_date})"
 
     # Fetch from day after latest to today
     start_dt = datetime.strptime(latest_date, "%Y-%m-%d") + timedelta(days=1)
     start_date = start_dt.strftime("%Y-%m-%d")
+    logger.info(f"Fetching updates for {ticker} from {start_date} to {today}")
 
     inserted, skipped, msg = fetch_fund_prices(ticker, start_date=start_date, end_date=today)
 
     # If no new data found but we have existing data, consider it up to date
     # (could be weekend/holiday or market hasn't closed yet)
     if inserted == 0 and skipped == 0 and "No data found" in msg:
+        logger.info(f"{ticker} appears up to date (no new data found)")
         return 0, 0, f"✅ {ticker} is up to date (latest: {latest_date})"
 
     return inserted, skipped, msg

@@ -11,11 +11,15 @@ Supports multiple asset types:
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Generator
 
 import pandas as pd
 
-DB_NAME = "portfolio.db"
+from core.config import get_settings
+from core.log import get_logger
+
+logger = get_logger("database")
 
 # Asset type constants
 ASSET_TEFAS = "TEFAS"
@@ -41,12 +45,17 @@ def get_connection() -> Generator[sqlite3.Connection, None, None]:
             c = conn.cursor()
             c.execute("SELECT * FROM table")
     """
-    conn = sqlite3.connect(DB_NAME)
+    # Ensure the directory exists
+    db_path = Path(get_settings().database_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     try:
         yield conn
         conn.commit()
-    except Exception:
+    except Exception as e:
+        logger.error(f"Database transaction failed, rolling back: {e}", exc_info=True)
         conn.rollback()
         raise
     finally:
@@ -70,58 +79,10 @@ def init_db() -> None:
                 currency TEXT NOT NULL DEFAULT 'TRY',
                 transaction_type TEXT NOT NULL DEFAULT 'BUY',
                 notes TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                price_per_share REAL DEFAULT NULL
             )
         """)
-
-        # Migrations for existing databases
-        c.execute("PRAGMA table_info(transactions)")
-        columns = [col[1] for col in c.fetchall()]
-
-        # Migration: Add tax_rate column if it doesn't exist
-        if "tax_rate" not in columns:
-            c.execute("ALTER TABLE transactions ADD COLUMN tax_rate REAL NOT NULL DEFAULT 0")
-
-        # Migration: Add asset_type column if it doesn't exist
-        if "asset_type" not in columns:
-            c.execute("ALTER TABLE transactions ADD COLUMN asset_type TEXT NOT NULL DEFAULT 'TEFAS'")
-
-        # Migration: Add currency column if it doesn't exist
-        if "currency" not in columns:
-            c.execute("ALTER TABLE transactions ADD COLUMN currency TEXT NOT NULL DEFAULT 'TRY'")
-
-        # Migration: Add transaction_type column if it doesn't exist
-        if "transaction_type" not in columns:
-            c.execute("ALTER TABLE transactions ADD COLUMN transaction_type TEXT NOT NULL DEFAULT 'BUY'")
-
-        # Migration: Add price_per_share column if it doesn't exist (nullable, for manual entry)
-        if "price_per_share" not in columns:
-            c.execute("ALTER TABLE transactions ADD COLUMN price_per_share REAL")
-
-        # Migration: Drop price_per_share column if it exists (old migration - no longer needed)
-        # This block is kept for historical reference but should not execute
-        if False and "price_per_share" in columns:
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS transactions_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL,
-                    ticker TEXT NOT NULL,
-                    quantity REAL NOT NULL,
-                    tax_rate REAL NOT NULL DEFAULT 0,
-                    asset_type TEXT NOT NULL DEFAULT 'TEFAS',
-                    currency TEXT NOT NULL DEFAULT 'TRY',
-                    notes TEXT,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            c.execute("""
-                INSERT INTO transactions_new (id, date, ticker, quantity, tax_rate, asset_type, currency, notes, created_at)
-                SELECT id, date, ticker, quantity, COALESCE(tax_rate, 0), 'TEFAS', 'TRY', notes, created_at
-                FROM transactions
-            """)
-            c.execute("DROP TABLE transactions")
-            c.execute("ALTER TABLE transactions_new RENAME TO transactions")
-
         # USD/TRY rates table - for USD-based inflation proxy
         c.execute("""
             CREATE TABLE IF NOT EXISTS cpi_usd_rates (
@@ -163,12 +124,6 @@ def init_db() -> None:
         c.execute("CREATE INDEX IF NOT EXISTS idx_fund_prices_ticker ON fund_prices(ticker)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_fund_prices_date ON fund_prices(date)")
 
-        # Migration: Add currency column to fund_prices if it doesn't exist
-        c.execute("PRAGMA table_info(fund_prices)")
-        fp_columns = [col[1] for col in c.fetchall()]
-        if "currency" not in fp_columns:
-            c.execute("ALTER TABLE fund_prices ADD COLUMN currency TEXT NOT NULL DEFAULT 'TRY'")
-
 
 # ============== TRANSACTION FUNCTIONS ==============
 
@@ -200,11 +155,13 @@ def add_transaction(
         price_per_share: Optional manual buy price. If None, price is looked up from fund_prices.
     """
     try:
+        logger.info(f"Adding transaction: {transaction_type} {ticker} x{quantity} on {date}")
         valid_date = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d")
         ticker_upper = ticker.upper().strip()
         tx_type = transaction_type.upper() if transaction_type else TX_BUY
 
         if tx_type not in [TX_BUY, TX_SELL]:
+            logger.warning(f"Invalid transaction type: {tx_type}")
             return f"❌ Invalid transaction type: {tx_type}. Must be BUY or SELL."
 
         # For cash, we don't need price lookup
@@ -216,22 +173,28 @@ def add_transaction(
                     (valid_date, ticker_upper, float(quantity), float(tax_rate), asset_type, currency, tx_type, notes, 1.0),
                 )
             action = "added" if tx_type == TX_BUY else "withdrawn"
+            logger.info(f"Cash transaction {action}: {quantity:,.2f} {currency} on {valid_date}")
             return f"✅ Cash {action}: {quantity:,.2f} {currency} on {valid_date}"
 
         # If price_per_share is provided, use it; otherwise look up from fund_prices
         if price_per_share is not None and price_per_share > 0:
             price = float(price_per_share)
+            logger.info(f"Using manual price: {price} for {ticker_upper}")
         else:
             # Verify price exists in fund_prices (for validation)
+            logger.info(f"Looking up price for {ticker_upper} on {valid_date}")
             price = get_fund_price_for_date(ticker_upper, valid_date, exact_match=False)
             if price is None:
                 source = "TEFAS" if asset_type == ASSET_TEFAS else "yfinance"
+                logger.warning(f"No price found for {ticker_upper} on or before {valid_date}")
                 return f"❌ No price found for {ticker_upper} on or before {valid_date}. Fetch {source} prices first or enter buy price manually."
 
         # For sells, verify we have enough shares
         if tx_type == TX_SELL:
             holdings = get_ticker_holdings(ticker_upper, valid_date)
+            logger.info(f"Checking holdings for {ticker_upper}: {holdings:.4f} available, {quantity:.4f} requested")
             if holdings < quantity:
+                logger.error(f"Insufficient shares: {holdings:.4f} < {quantity:.4f} for {ticker_upper}")
                 return f"❌ Insufficient shares: you have {holdings:.4f} {ticker_upper} but trying to sell {quantity:.4f}"
 
         with get_connection() as conn:
@@ -246,10 +209,13 @@ def add_transaction(
         action = "bought" if tx_type == TX_BUY else "sold"
         tax_str = f" (tax: {tax_rate}%)" if tax_rate > 0 else ""
         price_source = "manual" if price_per_share is not None else "auto"
+        logger.info(f"Transaction added successfully: {tx_type} {ticker_upper} x{quantity} @ {price:.6f} {currency} on {valid_date}")
         return f"✅ {tx_type}: {ticker_upper} x{quantity} @ {price:.6f} {currency} on {valid_date}{tax_str} ({price_source})"
-    except ValueError:
+    except ValueError as e:
+        logger.error(f"Invalid date format: {date} - {e}")
         return "❌ Error: Date must be in YYYY-MM-DD format"
     except Exception as e:
+        logger.error(f"Error adding transaction: {e}", exc_info=True)
         return f"❌ Error: {e}"
 
 
@@ -295,14 +261,20 @@ def get_ticker_holdings(ticker: str, as_of_date: str | None = None) -> float:
         return float(result[0]) if result and result[0] else 0.0
 
 
-def get_portfolio() -> pd.DataFrame:
-    """Retrieve all transactions as a Pandas DataFrame with prices from stored price_per_share or fund_prices."""
+def get_portfolio(ticker: str | None = None) -> pd.DataFrame:
+    """Retrieve all transactions as a Pandas DataFrame with prices from stored price_per_share or fund_prices.
+
+    Args:
+        ticker: Optional ticker symbol to filter by. If None, returns all transactions.
+
+    Returns:
+        DataFrame with portfolio transactions, optionally filtered by ticker.
+    """
     with get_connection() as conn:
         # Use stored price_per_share if available, otherwise look up from fund_prices
         # This handles weekends/holidays where exact date may not exist
         # For CASH assets, price_per_share is 1 (each unit is worth 1 of its currency)
-        df = pd.read_sql_query(
-            """
+        query = """
             SELECT 
                 t.id,
                 t.date,
@@ -322,10 +294,15 @@ def get_portfolio() -> pd.DataFrame:
                 t.notes,
                 t.created_at
             FROM transactions t
-            ORDER BY t.date DESC
-        """,
-            conn,
-        )
+        """
+
+        if ticker:
+            query += " WHERE t.ticker = ?"
+            query += " ORDER BY t.date DESC"
+            df = pd.read_sql_query(query, conn, params=(ticker,))
+        else:
+            query += " ORDER BY t.date DESC"
+            df = pd.read_sql_query(query, conn)
     return df
 
 
@@ -372,13 +349,17 @@ def get_tickers_with_info() -> list[dict]:
 def delete_transaction(transaction_id: int) -> str:
     """Delete a transaction by ID."""
     try:
+        logger.info(f"Deleting transaction ID: {transaction_id}")
         with get_connection() as conn:
             c = conn.cursor()
             c.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
             if c.rowcount > 0:
+                logger.info(f"Transaction #{transaction_id} deleted successfully")
                 return f"✅ Transaction #{transaction_id} deleted"
+            logger.warning(f"Transaction #{transaction_id} not found")
             return f"❌ Transaction #{transaction_id} not found"
     except Exception as e:
+        logger.error(f"Error deleting transaction {transaction_id}: {e}", exc_info=True)
         return f"❌ Error: {e}"
 
 

@@ -10,12 +10,16 @@ from datetime import datetime, timedelta
 import pandas as pd
 import yfinance as yf
 
+from core.log import get_logger
+
 from core.database import (
     CURRENCY_USD,
     bulk_add_fund_prices,
     get_fund_price_date_range,
     get_latest_fund_price,
 )
+
+logger = get_logger("yfinance")
 
 
 def fetch_stock_prices(
@@ -38,6 +42,7 @@ def fetch_stock_prices(
         Tuple of (inserted_count, skipped_count, status_message)
     """
     ticker = ticker.upper().strip()
+    logger.info(f"Fetching yfinance prices for {ticker} from {start_date} to {end_date}")
 
     # Default end_date to today
     if end_date is None:
@@ -51,10 +56,12 @@ def fetch_stock_prices(
 
     try:
         # Fetch data from yfinance
+        logger.debug(f"Calling yfinance API for {ticker}")
         stock = yf.Ticker(ticker)
         data = stock.history(start=start_date, end=end_date, auto_adjust=True)
 
         if data.empty:
+            logger.warning(f"No data found for {ticker} between {start_date} and {end_date}")
             return 0, 0, f"⚠️ No data found for {ticker} between {start_date} and {end_date}"
 
         all_prices = []
@@ -65,14 +72,18 @@ def fetch_stock_prices(
             all_prices.append((date_str, ticker, price))
 
         if not all_prices:
+            logger.warning(f"No prices extracted for {ticker} between {start_date} and {end_date}")
             return 0, 0, f"⚠️ No data found for {ticker} between {start_date} and {end_date}"
 
+        logger.info(f"Collected {len(all_prices)} prices for {ticker}, bulk inserting...")
         # Bulk insert all collected prices with USD currency
         inserted, skipped = bulk_add_fund_prices(all_prices, source="yfinance", currency=CURRENCY_USD)
+        logger.info(f"yfinance fetch completed for {ticker}: {inserted} inserted, {skipped} skipped")
 
         return inserted, skipped, f"✅ {ticker}: {inserted} new prices added, {skipped} already existed"
 
     except Exception as e:
+        logger.error(f"Error fetching yfinance prices for {ticker}: {e}", exc_info=True)
         return 0, 0, f"❌ Error fetching {ticker}: {e}"
 
 
@@ -89,30 +100,48 @@ def update_stock_prices(ticker: str) -> tuple[int, int, str]:
     """
     ticker = ticker.upper().strip()
     today = datetime.now().strftime("%Y-%m-%d")
+    logger.info(f"Updating yfinance prices for {ticker}")
 
     latest = get_latest_fund_price(ticker)
 
     if latest is None:
+        logger.info(f"No existing data for {ticker}, fetching full history")
         # No data exists, fetch full history
         return fetch_stock_prices(ticker, end_date=today)
 
     latest_date, _, _ = latest
+    latest_dt = datetime.strptime(latest_date, "%Y-%m-%d")
 
-    # Check if we're already up to date (within last 3 days to account for weekends/holidays)
-    days_since_latest = (datetime.now() - datetime.strptime(latest_date, "%Y-%m-%d")).days
-    if days_since_latest <= 3:
+    # If latest date is today, we're definitely up to date
+    if latest_date == today:
+        logger.info(f"{ticker} is up to date (latest: {latest_date} is today)")
         return 0, 0, f"✅ {ticker} is up to date (latest: {latest_date})"
 
-    # Fetch from day after latest to today
-    start_dt = datetime.strptime(latest_date, "%Y-%m-%d") + timedelta(days=1)
+    # Always try to fetch from day after latest to today
+    # This ensures we get data even on weekdays when markets are open
+    start_dt = latest_dt + timedelta(days=1)
     start_date = start_dt.strftime("%Y-%m-%d")
+
+    # If start_date is in the future, we're already up to date
+    if start_date > today:
+        logger.info(f"{ticker} is up to date (start_date {start_date} is in the future)")
+        return 0, 0, f"✅ {ticker} is up to date (latest: {latest_date})"
+
+    logger.info(f"Fetching updates for {ticker} from {start_date} to {today}")
 
     inserted, skipped, msg = fetch_stock_prices(ticker, start_date=start_date, end_date=today)
 
-    # If no new data found but we have existing data, consider it up to date
+    # If we inserted new data, return success
+    if inserted > 0:
+        return inserted, skipped, msg
+
+    # If no data was found (markets closed), return up to date message
     if inserted == 0 and skipped == 0 and "No data found" in msg:
+        logger.info(f"{ticker} appears up to date (no new data found, markets may be closed)")
         return 0, 0, f"✅ {ticker} is up to date (latest: {latest_date})"
 
+    # If skipped > 0, data already existed (shouldn't happen if we're fetching from day after latest)
+    # But return the message anyway
     return inserted, skipped, msg
 
 
@@ -213,10 +242,11 @@ def get_stock_info(ticker: str) -> dict | None:
         Dict with stock info or None if not found
     """
     try:
-        stock = yf.Ticker(ticker.upper().strip())
+        ticker = ticker.upper().strip()
+        stock = yf.Ticker(ticker)
         info = stock.info
         return {
-            "ticker": ticker.upper(),
+            "ticker": ticker,
             "name": info.get("shortName") or info.get("longName", ticker),
             "currency": info.get("currency", "USD"),
             "exchange": info.get("exchange", ""),

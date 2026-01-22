@@ -44,8 +44,17 @@ def handle_delete_transaction(transaction_id: int) -> tuple[str, pd.DataFrame]:
     return PortfolioService.delete_transaction(transaction_id)
 
 
-def refresh_portfolio() -> pd.DataFrame:
-    """Refresh the portfolio table."""
+def refresh_portfolio(ticker: str | None = None) -> pd.DataFrame:
+    """Refresh the portfolio table.
+
+    Args:
+        ticker: Optional ticker symbol to filter by. If None or empty, returns all transactions.
+
+    Returns:
+        DataFrame with portfolio transactions, optionally filtered by ticker.
+    """
+    if ticker and ticker.strip():
+        return PortfolioService.get_portfolio(ticker.strip())
     return PortfolioService.get_portfolio()
 
 

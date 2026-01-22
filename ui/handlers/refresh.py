@@ -17,7 +17,9 @@ from core.database import (
     bulk_import_cpi_official,
     get_cpi_official_data,
 )
+from core.log import get_logger
 
+logger = get_logger("refresh")
 
 # ============== CPI CSV IMPORT ==============
 
@@ -98,7 +100,7 @@ def handle_quick_check_us_stocks() -> tuple[str, pd.DataFrame]:
     """
     tickers_info = get_tickers_with_info()
     us_stocks = [info for info in tickers_info if info["asset_type"] == ASSET_USD_STOCK]
-
+    logger.info(f"Quick check US stocks: {us_stocks}")
     if not us_stocks:
         return "⚠️ No US stocks found in portfolio", pd.DataFrame()
 

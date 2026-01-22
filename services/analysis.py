@@ -23,7 +23,7 @@ class AnalysisService:
     """Service for portfolio analysis and real return calculations using FIFO cost basis."""
 
     @staticmethod
-    def analyze_portfolio(price_table_df: pd.DataFrame | None, auto_fetch: bool) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    def analyze_portfolio(price_table_df: pd.DataFrame | None, auto_fetch: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, str]:
         """
         Analyze portfolio with current prices and calculate real returns using FIFO.
 
@@ -34,7 +34,7 @@ class AnalysisService:
 
         Args:
             price_table_df: DataFrame with Ticker and Current Price columns
-            auto_fetch: Whether to auto-fetch missing USD rates from yfinance
+            auto_fetch: Whether to auto-fetch missing USD rates from yfinance (default: False)
 
         Returns:
             Tuple of (details_table, summary_table, status_message)
@@ -102,18 +102,8 @@ class AnalysisService:
                 invested = buy_price * quantity
                 current_value = lot_current_price * quantity
 
-                # Convert USD prices to TRY for analysis
-                buy_usd_rate = get_usd_rate(buy_date, auto_fetch=auto_fetch) if currency == CURRENCY_USD else None
-                current_usd_rate = get_usd_rate(today, auto_fetch=auto_fetch) if currency == CURRENCY_USD else None
-
-                if currency == CURRENCY_USD and buy_usd_rate and current_usd_rate:
-                    buy_price_try = buy_price * buy_usd_rate
-                    current_price_try = lot_current_price * current_usd_rate
-                else:
-                    buy_price_try = buy_price
-                    current_price_try = lot_current_price
-
-                # Calculate real return for this lot
+                # Calculate nominal return in original currency first (before conversion)
+                # This ensures nominal return reflects actual asset performance, not exchange rate changes
                 if asset_type == ASSET_CASH:
                     analysis = {
                         "nominal_pct": 0.0,
@@ -123,7 +113,32 @@ class AnalysisService:
                         "real_return_cpi_pct": None,
                     }
                 else:
-                    analysis = calculate_real_return(buy_price_try, current_price_try, buy_date, auto_fetch_usd=auto_fetch, tax_rate=tax_rate)
+                    # Calculate nominal return in original currency (USD or TRY)
+                    # Tax is applied on gains in the original currency
+                    try_gain = max(0, lot_current_price - buy_price)
+                    tax_amount = try_gain * (tax_rate / 100)
+                    after_tax_current = lot_current_price - tax_amount
+                    nominal_return = (after_tax_current - buy_price) / buy_price
+                    nominal_pct = round(nominal_return * 100, 2)
+
+                    # For USD stocks, convert to TRY for real return calculations
+                    # (comparing against TRY inflation benchmarks)
+                    buy_usd_rate = get_usd_rate(buy_date, auto_fetch=auto_fetch) if currency == CURRENCY_USD else None
+                    current_usd_rate = get_usd_rate(today, auto_fetch=auto_fetch) if currency == CURRENCY_USD else None
+
+                    if currency == CURRENCY_USD and buy_usd_rate and current_usd_rate:
+                        # Convert USD prices to TRY for real return calculation
+                        buy_price_try = buy_price * buy_usd_rate
+                        current_price_try = lot_current_price * current_usd_rate
+                        # Calculate real return using TRY prices (for comparison with TRY inflation)
+                        # Use tax_rate=0 since tax was already applied in USD calculation above
+                        # Skip USD and CPI calculations for USD stocks (CPI is Turkish inflation measure)
+                        analysis = calculate_real_return(buy_price_try, current_price_try, buy_date, auto_fetch_usd=auto_fetch, tax_rate=0, skip_usd_cpi=True)
+                        # Override nominal_pct with the USD-based calculation (original currency)
+                        analysis["nominal_pct"] = nominal_pct
+                    else:
+                        # TRY assets - use standard calculation
+                        analysis = calculate_real_return(buy_price, lot_current_price, buy_date, auto_fetch_usd=auto_fetch, tax_rate=tax_rate, skip_usd_cpi=False)
 
                 tax_str = f"{tax_rate:.2f}%" if tax_rate > 0 else "0%"
                 currency_display = currency if currency else "TRY"
@@ -203,11 +218,18 @@ class AnalysisService:
                     }
                 )
 
+        # Get today's USD rate for conversions
+        today_usd = get_usd_rate(today, auto_fetch=auto_fetch)
+
         # Build summary table
         summary_rows = []
-        grand_cost_basis = 0
-        grand_current_value = 0
-        grand_realized = 0
+        # Track totals in both currencies
+        grand_cost_basis_try = 0
+        grand_current_value_try = 0
+        grand_realized_try = 0
+        grand_cost_basis_usd = 0
+        grand_current_value_usd = 0
+        grand_realized_usd = 0
 
         for ticker, data in sorted(ticker_summary.items()):
             shares = data["shares_held"]
@@ -218,9 +240,43 @@ class AnalysisService:
             current_price = data["current_price"]
             currency = data["currency"]
 
-            grand_cost_basis += cost_basis
-            grand_current_value += current_value
-            grand_realized += realized
+            # Convert to both currencies for totals
+            if currency == CURRENCY_USD:
+                # USD asset - convert to TRY for TRY totals
+                if today_usd:
+                    cost_basis_try = cost_basis * today_usd
+                    current_value_try = current_value * today_usd
+                    realized_try = realized * today_usd
+                else:
+                    cost_basis_try = 0
+                    current_value_try = 0
+                    realized_try = 0
+                # USD totals (original currency)
+                cost_basis_usd = cost_basis
+                current_value_usd = current_value
+                realized_usd = realized
+            else:
+                # TRY asset - convert to USD for USD totals
+                if today_usd:
+                    cost_basis_usd = cost_basis / today_usd
+                    current_value_usd = current_value / today_usd
+                    realized_usd = realized / today_usd
+                else:
+                    cost_basis_usd = 0
+                    current_value_usd = 0
+                    realized_usd = 0
+                # TRY totals (original currency)
+                cost_basis_try = cost_basis
+                current_value_try = current_value
+                realized_try = realized
+
+            # Add to grand totals
+            grand_cost_basis_try += cost_basis_try
+            grand_current_value_try += current_value_try
+            grand_realized_try += realized_try
+            grand_cost_basis_usd += cost_basis_usd
+            grand_current_value_usd += current_value_usd
+            grand_realized_usd += realized_usd
 
             # Unrealized P/L
             unrealized_pl = current_value - cost_basis if shares > 0 else 0
@@ -257,39 +313,63 @@ class AnalysisService:
                 }
             )
 
-        # Add grand total row
+        # Add grand total rows - separate rows for TRY and USD
         if summary_rows:
-            grand_unrealized = grand_current_value - grand_cost_basis
-            grand_unrealized_pct = (grand_unrealized / grand_cost_basis * 100) if grand_cost_basis > 0 else 0
-            total_gain = grand_unrealized + grand_realized
+            grand_unrealized_try = grand_current_value_try - grand_cost_basis_try
+            grand_unrealized_pct_try = (grand_unrealized_try / grand_cost_basis_try * 100) if grand_cost_basis_try > 0 else 0
+            total_gain_try = grand_unrealized_try + grand_realized_try
 
+            # Add TRY total row
             summary_rows.append(
                 {
-                    "Ticker": "📊 TOTAL",
+                    "Ticker": "📊 TOTAL TRY",
                     "Shares": "",
                     "Avg Cost": "",
                     "Price": "",
-                    "Cost Basis": f"{grand_cost_basis:,.0f}",
-                    "Value": f"{grand_current_value:,.0f}",
-                    "Unreal P/L": f"{grand_unrealized:+,.0f}",
-                    "Unreal %": f"{grand_unrealized_pct:+.2f}%",
-                    "Realized": f"{grand_realized:+,.0f}",
+                    "Cost Basis": f"{grand_cost_basis_try:,.0f}",
+                    "Value": f"{grand_current_value_try:,.0f}",
+                    "Unreal P/L": f"{grand_unrealized_try:+,.0f}",
+                    "Unreal %": f"{grand_unrealized_pct_try:+.2f}%",
+                    "Realized": f"{grand_realized_try:+,.0f}",
                     "Real (USD)": "",
-                    "Real (CPI)": f"Total: {total_gain:+,.0f}",
+                    "Real (CPI)": f"Total: {total_gain_try:+,.0f}",
                     "_currency": "",
                 }
             )
 
-        # Get today's USD rate for status
-        today_usd = get_usd_rate(today, auto_fetch=auto_fetch)
+            # Add USD total row if USD rate is available
+            if today_usd:
+                grand_unrealized_usd = grand_current_value_usd - grand_cost_basis_usd
+                grand_unrealized_pct_usd = (grand_unrealized_usd / grand_cost_basis_usd * 100) if grand_cost_basis_usd > 0 else 0
+                total_gain_usd = grand_unrealized_usd + grand_realized_usd
+
+                summary_rows.append(
+                    {
+                        "Ticker": "📊 TOTAL USD",
+                        "Shares": "",
+                        "Avg Cost": "",
+                        "Price": "",
+                        "Cost Basis": f"{grand_cost_basis_usd:,.0f}",
+                        "Value": f"{grand_current_value_usd:,.0f}",
+                        "Unreal P/L": f"{grand_unrealized_usd:+,.0f}",
+                        "Unreal %": f"{grand_unrealized_pct_usd:+.2f}%",
+                        "Realized": f"{grand_realized_usd:+,.0f}",
+                        "Real (USD)": "",
+                        "Real (CPI)": f"Total: {total_gain_usd:+,.0f}",
+                        "_currency": "",
+                    }
+                )
 
         # Build status message
         status_parts = []
         if today_usd:
             status_parts.append(f"📊 Today's USD/TRY: {today_usd:.4f}")
         status_parts.append("📈 Using FIFO cost basis method")
-        if grand_realized != 0:
-            status_parts.append(f"💰 Total Realized Gains: {grand_realized:+,.0f}")
+        if grand_realized_try != 0 or grand_realized_usd != 0:
+            if today_usd:
+                status_parts.append(f"💰 Total Realized Gains: {grand_realized_try:+,.0f} TRY / {grand_realized_usd:+,.0f} USD")
+            else:
+                status_parts.append(f"💰 Total Realized Gains: {grand_realized_try:+,.0f} TRY")
         if errors:
             status_parts.append("\n".join(errors))
         else:

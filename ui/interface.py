@@ -14,7 +14,6 @@ from ui.handlers import (
     handle_add_transaction,
     handle_delete_transaction,
     refresh_portfolio,
-    handle_refresh_prices,
     get_ticker_price_table,
     get_unique_tickers,
     # Rate handlers
@@ -102,16 +101,42 @@ def create_ui() -> gr.Blocks:
             with gr.Row():
                 gr.Markdown("### Your Transactions")
                 btn_refresh_tx = gr.Button("🔄", variant="secondary", size="sm", scale=0, min_width=40)
+            with gr.Row():
+                tx_filter_ticker = gr.Dropdown(
+                    choices=["All"] + get_unique_tickers(),
+                    value="All",
+                    label="Filter by Ticker",
+                    info="Select a ticker to filter transactions",
+                    interactive=True,
+                )
             tx_table = gr.Dataframe(
                 value=refresh_portfolio(),
                 label="Portfolio Transactions",
                 interactive=False,
             )
 
+            # Helper function to update ticker dropdown choices
+            def update_ticker_choices() -> dict:
+                """Update ticker dropdown choices."""
+                return gr.update(choices=["All"] + get_unique_tickers())
+
+            # Filter change handler
+            def filter_portfolio(ticker_filter: str) -> pd.DataFrame:
+                """Filter portfolio by ticker."""
+                if ticker_filter == "All" or not ticker_filter:
+                    return refresh_portfolio()
+                return refresh_portfolio(ticker_filter)
+
             # Transaction event handlers
-            btn_add_tx.click(handle_add_transaction, inputs=[tx_date, tx_ticker, tx_qty, tx_tax, tx_notes, tx_asset_type, tx_type, tx_buy_price], outputs=[tx_status, tx_table])
-            btn_del_tx.click(handle_delete_transaction, inputs=[del_tx_id], outputs=[tx_status, tx_table])
-            btn_refresh_tx.click(refresh_portfolio, outputs=[tx_table])
+            btn_add_tx.click(handle_add_transaction, inputs=[tx_date, tx_ticker, tx_qty, tx_tax, tx_notes, tx_asset_type, tx_type, tx_buy_price], outputs=[tx_status, tx_table]).then(
+                update_ticker_choices, outputs=[tx_filter_ticker]
+            ).then(filter_portfolio, inputs=[tx_filter_ticker], outputs=[tx_table])
+            btn_del_tx.click(handle_delete_transaction, inputs=[del_tx_id], outputs=[tx_status, tx_table]).then(update_ticker_choices, outputs=[tx_filter_ticker]).then(
+                filter_portfolio, inputs=[tx_filter_ticker], outputs=[tx_table]
+            )
+            btn_refresh_tx.click(update_ticker_choices, outputs=[tx_filter_ticker]).then(filter_portfolio, inputs=[tx_filter_ticker], outputs=[tx_table])
+
+            tx_filter_ticker.change(filter_portfolio, inputs=[tx_filter_ticker], outputs=[tx_table])
 
         # ============== TAB 2: DATA MANAGEMENT ==============
         with gr.Tab("📊 Data Management"):
@@ -353,7 +378,7 @@ def create_ui() -> gr.Blocks:
                     btn_long_check_tefas.click(handle_long_check_tefas, outputs=[tefas_status, tefas_table])
 
         # ============== TAB 3: ANALYSIS ==============
-        with gr.Tab("📈 Analyze Returns"):
+        with gr.Tab("📈 Analyze Returns") as analysis_tab:
             gr.Markdown(
                 """
                 ### Calculate Real Returns
@@ -366,24 +391,14 @@ def create_ui() -> gr.Blocks:
 
             gr.Markdown("#### Current Prices")
 
-            with gr.Row():
-                price_table = gr.Dataframe(
-                    value=get_ticker_price_table(),
-                    label="Enter current prices for each ticker (auto-filled from price data)",
-                    interactive=True,
-                    column_count=(3, "fixed"),
-                    scale=2,
-                )
-                with gr.Column(scale=1):
-                    btn_refresh_tickers = gr.Button("🔄 Refresh Tickers", variant="secondary")
-                    btn_refresh_prices = gr.Button("📈 Update Prices", variant="secondary")
-                    auto_fetch_chk = gr.Checkbox(label="Auto-fetch missing USD rates", value=True, info="Fetches from Yahoo Finance")
+            price_table = gr.Dataframe(
+                value=get_ticker_price_table(),
+                label="Enter current prices for each ticker (auto-filled from price data)",
+                interactive=True,
+                column_count=(3, "fixed"),
+            )
 
-            price_status = gr.Textbox(label="Price Update Status", interactive=False, visible=True)
             btn_calc = gr.Button("🧮 Calculate Real Gains", variant="primary", size="lg")
-
-            btn_refresh_tickers.click(get_ticker_price_table, outputs=[price_table])
-            btn_refresh_prices.click(handle_refresh_prices, outputs=[price_status, price_table])
 
             calc_status = gr.Textbox(label="Calculation Status", interactive=False)
 
@@ -419,7 +434,10 @@ def create_ui() -> gr.Blocks:
             )
 
             # Analysis event handlers
-            btn_calc.click(analyze_portfolio, inputs=[price_table, auto_fetch_chk], outputs=[out_table, summary_table, calc_status])
+            btn_calc.click(analyze_portfolio, inputs=[price_table], outputs=[out_table, summary_table, calc_status])
+
+            # Auto-refresh tickers when tab is selected
+            analysis_tab.select(get_ticker_price_table, outputs=[price_table])
 
         # ============== TAB 4: FUND CHARTS ==============
         with gr.Tab("📉 Fund Charts"):
